@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""qmap job.py — run a Python job file as an LSF or Slurm job array.
+
+Reached through `qmap`, which dispatches here when an argument is a .py file.
+
+A job file is ordinary Python with two additions: a header of #key=value lines
+that set the submission parameters, and `!` lines that run a shell command.
+
+    #workload_manager=slurm
+    #account=siyoungk
+    #time=4:00:00
+    #gpu=1
+
+    import glob
+    ifiles = glob.glob('*/*/*.mae')
+
+    ! mkdir -p step3
+
+    for ifile in ifiles:
+        workdir = ifile.split('/')[1]
+        ! boonza md ${ifile} --workdir step3/${workdir}
+
+    $ qmap thatfile.py
+
+The Python runs once, here, on the login node: it is what decides the list of
+tasks. A `!` at the top level runs immediately while that happens, which is how
+`mkdir -p step3` gets made before anything is submitted. A `!` inside a loop is
+not run — it is collected, one task per iteration of the innermost loop, and
+those become the job array. Values are interpolated from the surrounding Python
+scope and shell-quoted, so a path with a space survives; a $NAME that is not a
+Python variable is left alone and resolves on the compute node.
+
+Any other flags are passed through to qmap and override the header, so
+`qmap job.py --dry-run` shows the script without submitting.
+"""
+
+import ast
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+QMAP = Path(__file__).resolve().parent / "qmap"
+PROG = "qmap"
+
+# header key -> qmap option
+DIRECTIVES = {
+    "workload_manager": "--scheduler", "scheduler": "--scheduler",
+    "account": "--account", "project": "--account",
+    "time": "--walltime", "walltime": "--walltime",
+    "core": "--cores", "cores": "--cores", "cpu": "--cores", "cpus": "--cores",
+    "cores_per_gpu": "--cores-per-gpu",
+    "gpu": "--gpu", "gpus": "--gpu",
+    "node": "--nodes", "nodes": "--nodes",
+    "queue": "--queue", "partition": "--queue",
+    "qos": "--qos",
+    "mem": "--mem", "memory": "--mem",
+    "constraint": "--constraint",
+    "concurrency": "--concurrency",
+    "conda": "--conda", "env": "--conda",
+    "module": "--module",
+    "directive": "--directive",
+    "export": "--export",
+    "setup": "--setup",
+    "name": "--name",
+    "logdir": "--logdir",
+    "template": "--template",
+}
+REPEATABLE = {"--module", "--directive", "--export", "--setup", "--template"}
+
+BANG = re.compile(r"^(?P<indent>[ \t]*)!(?P<cmd>.*)$")
+VAR = re.compile(r"\$\{(?P<braced>[A-Za-z_]\w*)\}|\$(?P<bare>[A-Za-z_]\w*)")
+
+
+def die(msg):
+    sys.exit(f"{PROG}: {msg}")
+
+
+def known_templates():
+    try:
+        out = subprocess.run([str(QMAP), "templates"], capture_output=True, text=True).stdout
+    except OSError:
+        return set()
+    names = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and not line.startswith("no templates"):
+            names.add(parts[0])
+    return names
+
+
+def parse_header(text):
+    """The leading comment block: #key=value, or #name for a registered template.
+
+    A comment with a space after the # is prose and is left alone, which is how
+    a bare #template_name stays unambiguous.
+    """
+    flags, seen = [], {}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        if not line.startswith("#"):
+            break
+        if line.startswith("#!"):
+            continue
+        body = line[1:]
+        if body[:1] in (" ", "\t", "#", "") :        # prose comment
+            continue
+        if "=" in body:
+            key, value = body.split("=", 1)
+            key, value = key.strip().lower(), value.strip()
+            if key not in DIRECTIVES:
+                die(f"{lineno}: unknown header key '{key}'\n"
+                    f"       known: {', '.join(sorted(set(DIRECTIVES)))}")
+            if not value:                            # '#account=' is a blank to fill in
+                continue
+            opt = DIRECTIVES[key]
+            if opt not in REPEATABLE and opt in seen:
+                die(f"{lineno}: '{key}' set twice")
+            seen[opt] = True
+            flags += [opt, value]
+        else:
+            name = body.strip()
+            if name not in known_templates():
+                die(f"{lineno}: no template '{name}'\n"
+                    f"       '{PROG} templates' lists them; for a plain comment, "
+                    f"put a space after the #")
+            flags += ["--template", name]
+    return flags
+
+
+def transform(text, path):
+    """`!` lines become calls, then loops holding them get an iteration marker."""
+    out = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        m = BANG.match(raw)
+        if m:
+            out.append(f"{m.group('indent')}_qmp.bang({m.group('cmd').strip()!r}, {lineno})")
+        else:
+            out.append(raw)
+    tree = ast.parse("\n".join(out), filename=str(path))
+
+    def holds_bang(node):
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "bang" for n in ast.walk(node)
+        )
+
+    def inner_loops(node):
+        """The innermost loops that hold a `!`: one task per iteration of these."""
+        found = []
+        for child in ast.iter_child_nodes(node):
+            deeper = inner_loops(child)
+            if deeper:
+                found += deeper
+            elif isinstance(child, (ast.For, ast.While, ast.AsyncFor)) and holds_bang(child):
+                found.append(child)
+        return found
+
+    for loop in inner_loops(tree):
+        marker = ast.parse("with _qmp.iteration():\n    pass").body[0]
+        marker.body = loop.body
+        loop.body = [marker]
+    ast.fix_missing_locations(tree)
+    return tree
+
+
+class Runtime:
+    """Collects the tasks, and runs the setup commands as they are reached."""
+
+    def __init__(self, dry_run):
+        self.tasks = []
+        self.group = None
+        self.dry_run = dry_run
+
+    def interpolate(self, cmd, frame):
+        scope = dict(frame.f_globals)
+        scope.update(frame.f_locals)
+
+        def sub(m):
+            name = m.group("braced") or m.group("bare")
+            if name in scope:
+                return shlex.quote(str(scope[name]))
+            return m.group(0)        # not Python's: leave it for the task's shell
+
+        return VAR.sub(sub, cmd)
+
+    def bang(self, cmd, lineno):
+        line = self.interpolate(cmd, sys._getframe(1))
+        if self.group is None:
+            self.sh(line)            # top level: part of getting ready to submit
+        else:
+            self.group.append(line)  # in a loop: part of the array
+
+    def sh(self, cmd):
+        print(f"{PROG}: ! {cmd}", file=sys.stderr)
+        if self.dry_run:
+            return
+        if subprocess.run(cmd, shell=True).returncode != 0:
+            die(f"setup command failed: {cmd}")
+
+    def task(self, cmd):
+        (self.group if self.group is not None else self.tasks).append(cmd)
+
+    def iteration(self):
+        return _Iteration(self)
+
+
+class _Iteration:
+    def __init__(self, rt):
+        self.rt = rt
+
+    def __enter__(self):
+        self.outer = self.rt.group
+        self.rt.group = []
+        return self
+
+    def __exit__(self, *exc):
+        group, self.rt.group = self.rt.group, self.outer
+        if exc[0] is None and group:
+            # Several ! lines in one iteration are one task, in order, stopping
+            # at the first failure.
+            self.rt.tasks.append(" && ".join(group))
+        return False
+
+
+def looks_like_job_file(arg):
+    """Same rule as the qmap side: a .py file, or one with qmap on line one."""
+    if arg.startswith("-"):
+        return False
+    path = Path(arg)
+    if not path.is_file():
+        return False
+    if arg.endswith(".py"):
+        return True
+    try:
+        with path.open() as fh:
+            return "qmap" in fh.readline()
+    except OSError:
+        return False
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+
+    path, passthrough = None, []
+    for arg in argv:
+        if path is None and looks_like_job_file(arg):
+            path = Path(arg)
+        else:
+            passthrough.append(arg)
+    if path is None:
+        die("no job file among the arguments")
+    text = path.read_text()
+
+    flags = parse_header(text)
+    if "--name" not in flags and "--name" not in passthrough:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", path.stem)
+        if not re.match(r"[A-Za-z_]", name):
+            name = "j" + name
+        flags += ["--name", name]
+
+    dry = "--dry-run" in passthrough
+    rt = Runtime(dry)
+    module = {"__name__": "__main__", "__file__": str(path), "_qmp": rt,
+              "task": rt.task, "sh": rt.sh}
+    try:
+        exec(compile(transform(text, path), str(path), "exec"), module)
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        die(f"{path} raised before anything was submitted")
+
+    if not rt.tasks:
+        die(f"no tasks in {path}: a `!` command inside a for loop is what becomes "
+            f"the array (or call task('...') directly)")
+
+    shown = rt.tasks if len(rt.tasks) <= 6 else rt.tasks[:3] + [f"... {len(rt.tasks) - 6} more ..."] + rt.tasks[-3:]
+    plural = "" if len(rt.tasks) == 1 else "s"
+    print(f"{PROG}: {len(rt.tasks)} task{plural} from {path}", file=sys.stderr)
+    for t in shown:
+        print(f"  {t}", file=sys.stderr)
+
+    listing = tempfile.NamedTemporaryFile("w", suffix=".tasks", delete=False)
+    with listing as fh:
+        for t in rt.tasks:
+            fh.write(t + "\n")
+    try:
+        cmd = [str(QMAP), "--list", listing.name] + flags + passthrough + \
+              ["--", "sh", "-c", "{input}"]
+        return subprocess.run(cmd).returncode
+    finally:
+        os.unlink(listing.name)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

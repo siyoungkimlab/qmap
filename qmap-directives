@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Read a block of #SBATCH or #BSUB directives and print the qmap options
+that mean the same thing, one per line — the format templates are stored in.
+
+    qmap convert step3_md.sh slurm     # LSF script -> Slurm directives
+    qmap register NAME --from job.sub  # a pasted block -> a template
+
+Durations become unit-suffixed (4h, 90m) because the two schedulers spell
+them differently and neither rejects the other's spelling: LSF reads 24:00 as
+24 hours, Slurm reads it as 24 minutes. qmap renders the units back into
+whichever form the target scheduler wants.
+"""
+
+import re
+import shlex
+import sys
+
+PROG = "qmap"
+
+
+def die(msg):
+    sys.exit(f"{PROG}: {msg}")
+
+
+def note(msg):
+    print(f"{PROG}: {msg}", file=sys.stderr)
+
+
+def minutes_to_units(total):
+    if total <= 0:
+        return "0m"
+    h, m = divmod(total, 60)
+    return (f"{h}h" if h else "") + (f"{m}m" if m or not h else "")
+
+
+def lsf_walltime(value):
+    """LSF -W: [hours:]minutes."""
+    if ":" in value:
+        h, m = value.split(":", 1)
+        return int(h) * 60 + int(m)
+    return int(value)
+
+
+def slurm_walltime(value):
+    """Slurm -t: minutes | mm:ss | hh:mm:ss | d-hh[:mm[:ss]]."""
+    days = 0
+    if "-" in value:
+        d, value = value.split("-", 1)
+        days = int(d)
+    parts = value.split(":")
+    if days:                      # d-hh[:mm[:ss]]
+        hh = int(parts[0])
+        mm = int(parts[1]) if len(parts) > 1 else 0
+        ss = int(parts[2]) if len(parts) > 2 else 0
+    elif len(parts) == 3:         # hh:mm:ss
+        hh, mm, ss = (int(p) for p in parts)
+    elif len(parts) == 2:         # mm:ss
+        hh, mm, ss = 0, int(parts[0]), int(parts[1])
+    else:                         # minutes
+        hh, mm, ss = 0, int(parts[0]), 0
+    return days * 1440 + hh * 60 + mm + (1 if ss else 0)
+
+
+def has_shell(value):
+    """A value the shell would expand cannot be converted, only reported."""
+    return value is not None and ("$" in value or "`" in value)
+
+
+def join_continuations(text):
+    out, pending = [], ""
+    for line in text.splitlines():
+        if line.rstrip().endswith("\\"):
+            pending += line.rstrip()[:-1] + " "
+        else:
+            out.append(pending + line)
+            pending = ""
+    if pending:
+        out.append(pending)
+    return out
+
+
+def tokenize(text):
+    """Directives as (scheduler, [tokens]), from #SBATCH/#BSUB lines or from an
+    sbatch/bsub command line — scripts in the wild use both."""
+    lines = join_continuations(text)
+    found = []
+    for raw in lines:
+        line = raw.strip()
+        # Exactly #SBATCH / #BSUB: a comment such as "# bsub < job.sub" is
+        # documentation, not a directive.
+        m = re.match(r"^#(SBATCH|BSUB)\b(.*)$", line)
+        if not m:
+            continue
+        try:
+            found.append((m.group(1).lower(), shlex.split(m.group(2), comments=True)))
+        except ValueError as exc:
+            die(f"cannot read directive line: {line} ({exc})")
+    if found:
+        return found
+
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r"^(?:\S*=\S*\s+)*(sbatch|bsub)\b(.*)$", line)
+        if not m:
+            continue
+        body = m.group(2)
+        body = body.split("<", 1)[0]              # bsub < script
+        try:
+            tokens = shlex.split(body, comments=True)
+        except ValueError as exc:
+            die(f"cannot read command line: {line} ({exc})")
+        if tokens and not tokens[-1].startswith("-"):
+            tokens = tokens[:-1]                  # the script being submitted
+        kind = "bsub" if m.group(1) == "bsub" else "sbatch"
+        note(f"read the {m.group(1)} command line rather than #{kind.upper()} lines")
+        return [(kind, tokens)]
+
+    # A bare flag line, as pasted out of a submit command. Which scheduler it
+    # came from has to be inferred, and guessing wrong would be worse than
+    # saying so.
+    LSF_ONLY = {"-gpu", "-R", "-W", "-P", "-L", "-sp", "-sla", "-app"}
+    SLURM_ONLY = {"--gres", "--gpus", "--array", "--mem", "--cpus-per-task",
+                  "--partition", "--ntasks", "--time", "--qos", "--job-name",
+                  "--constraint", "--account", "-t", "-C"}
+    for raw in lines:
+        line = raw.strip()
+        if not line.startswith("-"):
+            continue
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError as exc:
+            die(f"cannot read flag line: {line} ({exc})")
+        heads = {t.split("=", 1)[0] for t in tokens if t.startswith("-")}
+        lsf, slurm = heads & LSF_ONLY, heads & SLURM_ONLY
+        if lsf and not slurm:
+            kind = "bsub"
+        elif slurm and not lsf:
+            kind = "sbatch"
+        else:
+            die("cannot tell whether these are LSF or Slurm flags; "
+                "prefix the line with '#BSUB ' or '#SBATCH '")
+        note(f"read a bare {'LSF' if kind == 'bsub' else 'Slurm'} flag line")
+        return [(kind, tokens)]
+    return []
+
+
+def keep(out, flag, value, shown):
+    """Record a value, unless the shell would have to expand it first."""
+    if value is None:
+        return
+    if has_shell(value):
+        note(f"left out {shown} {value}: a shell variable")
+        return
+    out[flag] = value
+
+
+def parse_lsf(tokens, out, extra):
+    it = iter(range(len(tokens)))
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        if t == "-q":
+            keep(out, "--queue", nxt, "-q"); i += 2
+        elif t == "-P":
+            keep(out, "--account", nxt, "-P"); i += 2
+        elif t == "-n":
+            keep(out, "--cores", nxt, "-n"); i += 2
+        elif t == "-W":
+            if has_shell(nxt):
+                note(f"left out -W {nxt}: a shell variable, not a duration")
+            else:
+                out["--walltime"] = minutes_to_units(lsf_walltime(nxt))
+            i += 2
+        elif t == "-J":
+            name = nxt or ""
+            m = re.match(r"^([^\[]+)(\[[^\]]*\])?(?:%(\d+))?$", name)
+            if m:
+                keep(out, "--name", m.group(1), "-J")
+                if m.group(3):
+                    out["--concurrency"] = m.group(3)
+            i += 2
+        elif t == "-gpu":
+            m = re.search(r"num=(\d+)", nxt or "")
+            if m:
+                out["--gpu"] = m.group(1)
+            i += 2
+        elif t == "-R":
+            spec = nxt or ""
+            if spec.startswith("span["):
+                pass                       # implied by one task on one host
+            elif spec.startswith("rusage["):
+                m = re.search(r"mem=([^\],]+)", spec)
+                if m:
+                    out["--mem"] = m.group(1)
+            else:
+                out["--constraint"] = spec
+            i += 2
+        elif t in ("-o", "-e"):
+            i += 2                         # log paths are qmap's to generate
+        elif t == "-L":
+            i += 2                         # always emitted
+        elif t == "-u":
+            note("dropped -u: qmap has no mail support"); i += 2
+        else:
+            if nxt and not nxt.startswith("-"):
+                extra.append(f"{t} {nxt}"); i += 2
+            else:
+                extra.append(t); i += 1
+
+
+def parse_slurm(tokens, out, extra):
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if "=" in t and t.startswith("--"):
+            t, value = t.split("=", 1)
+            consumed = 1
+        else:
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            if nxt is None or nxt.startswith("-"):
+                value, consumed = None, 1     # a flag on its own, like --exclusive
+            else:
+                value, consumed = nxt, 2
+        if t in ("-A", "--account"):
+            keep(out, "--account", value, t)
+        elif t in ("-p", "--partition"):
+            keep(out, "--queue", value, t)
+        elif t in ("-q", "--qos"):
+            keep(out, "--qos", value, t)
+        elif t in ("-N", "--nodes"):
+            keep(out, "--nodes", value, t)
+        elif t in ("-c", "--cpus-per-task"):
+            keep(out, "--cores", value, t)
+        elif t in ("-t", "--time"):
+            if has_shell(value):
+                note(f"left out {t} {value}: a shell variable, not a duration")
+            else:
+                out["--walltime"] = minutes_to_units(slurm_walltime(value))
+        elif t in ("-J", "--job-name"):
+            keep(out, "--name", value, t)
+        elif t in ("-C", "--constraint"):
+            keep(out, "--constraint", value, t)
+        elif t == "--mem":
+            keep(out, "--mem", value, t)
+        elif t in ("--gres", "--gpus"):
+            m = re.search(r"(?:gpu:)?(\d+)$", value or "")
+            if m:
+                out["--gpu"] = m.group(1)
+        elif t == "--array":
+            m = re.search(r"%(\d+)", value or "")
+            if m:
+                out["--concurrency"] = m.group(1)
+        elif t in ("-n", "--ntasks"):
+            if value != "1":
+                extra.append(f"{t} {value}")   # one task per array element is the shape
+        elif t in ("-o", "--output", "-e", "--error"):
+            pass
+        elif t.startswith("--mail"):
+            note(f"dropped {t}: qmap has no mail support")
+        else:
+            if value is None:
+                extra.append(t)
+            else:
+                extra.append(f"{t}={value}" if consumed == 1 else f"{t} {value}")
+        i += consumed
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    source = argv[0]
+    text = sys.stdin.read() if source == "-" else open(source).read()
+
+    blocks = tokenize(text)
+    if not blocks:
+        die(f"no #SBATCH or #BSUB lines in {'standard input' if source == '-' else source}")
+    kinds = {k for k, _ in blocks}
+    if len(kinds) > 1:
+        die("both #SBATCH and #BSUB lines are present; split them first")
+    kind = kinds.pop()
+
+    out, extra = {}, []
+    for _, tokens in blocks:
+        (parse_lsf if kind == "bsub" else parse_slurm)(tokens, out, extra)
+
+    print("--scheduler")
+    print("lsf" if kind == "bsub" else "slurm")
+    for flag, value in out.items():
+        if value is None:
+            continue
+        print(flag)
+        print(value)
+    for raw in extra:
+        note(f"kept as a raw directive: {raw}")
+        print("--directive")
+        print(raw)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

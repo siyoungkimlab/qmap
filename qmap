@@ -1,0 +1,851 @@
+#!/usr/bin/env bash
+# qmap — map one command over a list of inputs, as an LSF or Slurm job array.
+#
+# Every array job has the same three parts: a list of inputs, a command line to
+# run on each one, and a block of scheduler directives. Only the directives
+# differ between clusters. This writes those, templates your command line with
+# Python's str.format syntax, and submits. It knows nothing about any
+# particular program.
+#
+#   qmap --inputs 'preds/*/*.mae' --gpu 1 --walltime 4:00 \
+#            -- mycmd {input} --out {input.parent}/run_{input.stem}
+#
+# No submission parameter is set for you: an account, queue, walltime or core
+# count appears in the generated script only because you asked for it, here or
+# through a registered template. Register the sets you keep retyping:
+#
+#   qmap register gautschi-h100 --scheduler slurm --account siyoungk \
+#       --queue ai --cores-per-gpu 14 --directive '-q normal'
+#   qmap --template gautschi-h100 --gpu 1 --walltime 2:00:00 ...
+#
+# Nothing is hidden: each submission writes the generated script and the exact
+# input list under .qmap/, and --dry-run prints that script rather than
+# submitting it. The script stands alone, so you can edit and resubmit it by
+# hand when a job needs something no flag covers.
+#
+# Kept compatible with bash 3.2 (macOS), so no associative arrays here.
+
+set -euo pipefail
+
+VERSION=0.4.0
+PROG=${0##*/}
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+USER_TPL_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/qmap/templates
+TPL_DIRS="$USER_TPL_DIR $SELF_DIR/templates"
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+    cat <<'USAGE'
+usage: qmap [options] -- COMMAND [ARGS...]
+       qmap JOB.py [options]            run a Python job file
+       qmap directives NAME [lsf|slurm]  print a template's #SBATCH/#BSUB block
+       qmap convert FILE [lsf|slurm]     convert a script's directives to the
+                                         other scheduler ('-' reads stdin)
+       qmap register NAME [--note TEXT] [options]   save these under NAME
+       qmap templates                   list registered templates
+       qmap show NAME                   print one template
+       qmap forget NAME                 delete one template
+
+Nothing is submitted for you by default: every account, queue, walltime and
+core count in the generated script is one you passed, here or via --template.
+
+Job files are ordinary Python with a #key=value header and `!` shell lines; a
+`!` inside a loop becomes one array task per iteration. See the README, or the
+top of qmap-jobfile, for the whole of it.
+
+Inputs (at least one; repeatable, order preserved)
+  --inputs GLOB        quote it: expanded here, not by your shell
+  --list FILE          one input per line (blank lines and #comments skipped)
+  --input VALUE        a single input, e.g. a parameter rather than a path
+  --stdin              read the list from standard input
+
+Templating — Python str.format over pathlib, in COMMAND and in --done-when
+  {input} or {}        the whole line
+  {input.name}         basename                     foo/bar.prepped.mae -> bar.prepped.mae
+  {input.stem}         basename minus last suffix   -> bar.prepped
+  {input.suffix}       last suffix, with the dot    -> .mae
+  {input.parent}       dirname                      -> foo
+                       chainable: {input.parent.name}, {input.parent.parent}
+  {0} {1} {2} ...      whitespace-separated fields of the line, as positional
+                       args would be in Python; attributes work on them too,
+                       e.g. {1.stem}, for parameter sweeps from a table
+  {index} or {i}       1-based task index; format specs work: {index:04d}
+  {n}                  total number of tasks
+  {{ and }}            a literal brace, as in Python: awk '{{print $1}}'
+  ${VAR}               passed through, resolved in the task's environment
+
+Templates
+  --template NAME      apply a registered template, repeatable; its options
+  -T NAME              are spliced in where it appears, so anything you write
+                       after it wins. Templates may reference templates.
+
+Submission parameters (all optional; omitted from the script when not given)
+  --name NAME          job name (default: the command's basename)
+  --gpu N              GPUs per task
+  --cores N            cores per task
+  --cores-per-gpu N    derive --cores from --gpu when --cores is not given
+  --nodes N            nodes per task
+  --walltime T         4h, 90m, 2d12h — units are converted to whichever form
+                       the scheduler wants; a bare 24:00 is passed through as
+                       typed (LSF reads it as 24 hours, Slurm as 24 minutes)
+  --mem SPEC           Slurm --mem=SPEC, LSF rusage[mem=SPEC]
+  --queue Q            the partition or LSF queue: Slurm -p, LSF -q
+  --qos Q              Slurm QOS (-q); LSF has none, use --directive
+  --account A          LSF -P / Slurm -A
+  --constraint C       LSF -R C / Slurm -C C   (e.g. A100)
+  --concurrency N      cap tasks running at once
+  --directive TEXT     raw extra directive, repeatable (e.g. --directive '-q normal')
+
+Environment on the compute node
+  --conda ENV          conda activate ENV (sources conda's profile.d first)
+  --module M           module load M, repeatable
+  --no-module          drop modules a template would load
+  --export VAR=VAL     export into the task, repeatable
+  --setup 'LINE'       arbitrary shell line before the command, repeatable
+  --chdir DIR          cd here first (default: the current directory)
+
+Behaviour
+  --done-when 'TEST'   shell test per task; if it succeeds, skip that input
+  --logdir DIR         per-task stdout/stderr (default logs_<name>)
+  --scheduler S        lsf | slurm | auto (default auto, from what is on PATH)
+  --dry-run, -n        print the generated script, submit nothing
+  --version, --help
+USAGE
+}
+
+KNOWN_FLAGS="--inputs --list --input --stdin --name --gpu --gpus --cores -c
+--cores-per-gpu --nodes --walltime --mem --queue --qos --account
+--constraint --concurrency --directive --conda --env --module --no-module
+--no-modules --export --setup --chdir --done-when --logdir
+--scheduler --template -T --dry-run"
+
+DIRECTIVE_READER=$SELF_DIR/qmap-directives
+OPTS=(); NO=0
+read_directives() {   # FILE or '-' -> OPTS
+    OPTS=(); NO=0
+    while IFS= read -r line; do
+        OPTS[NO]=$line; NO=$((NO+1))
+    done < <(python3 "$DIRECTIVE_READER" "$1")
+    [ "$NO" -gt 0 ] || die "no directives read from $1"
+}
+
+# A duration written with units (4h, 90m, 2d12h) is unambiguous; each
+# scheduler then gets its own spelling. Anything else is passed through as
+# typed, which is what --scheduler mismatches get warned about.
+units_to_min() {
+    local v=$1 total=0 num=
+    [ -n "$v" ] || return 1
+    while [ -n "$v" ]; do
+        case $v in
+            [0-9]*) num=${v%%[!0-9]*}; v=${v#"$num"} ;;
+            *) return 1 ;;
+        esac
+        case $v in
+            d*) total=$((total + num * 1440)); v=${v#d} ;;
+            h*) total=$((total + num * 60)); v=${v#h} ;;
+            m*) total=$((total + num)); v=${v#m} ;;
+            *) return 1 ;;
+        esac
+    done
+    printf '%s' "$total"
+}
+
+tpl_file() {   # NAME -> path of an existing template
+    for d in $TPL_DIRS; do
+        [ -f "$d/$1.args" ] && { printf '%s\n' "$d/$1.args"; return 0; }
+    done
+    return 1
+}
+
+check_name() {
+    case $1 in
+        '' | *[!A-Za-z0-9_.-]* | -*) die "template name '$1' may hold only letters, digits, . _ -" ;;
+    esac
+}
+
+# A template is the option list itself, one argument per line, so a value may
+# hold spaces or quotes without any escaping rules of its own.
+TPL_ARGS=()
+tpl_load() {
+    local f line
+    check_name "$1"
+    f=$(tpl_file "$1") || die "no template '$1'; 'qmap templates' lists them"
+    TPL_ARGS=(); local k=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in '' | \#*) continue ;; esac
+        TPL_ARGS[k]=$line; k=$((k+1))
+    done < "$f"
+}
+
+# --------------------------------------------------------------- job files
+# `qmap job.py` runs a Python job file; the flag form always has a -- payload,
+# so the two never collide.
+JOBFILE_RUNNER=$SELF_DIR/qmap-jobfile
+has_payload=0
+for a in ${@+"$@"}; do
+    [ "$a" = "--" ] && { has_payload=1; break; }
+done
+if [ "$has_payload" -eq 0 ]; then
+    for a in ${@+"$@"}; do
+        case $a in
+            -*) continue ;;
+            *.py)
+                [ -f "$a" ] || die "no such job file: $a"
+                exec python3 "$JOBFILE_RUNNER" "$@" ;;
+            *)
+                # An executable job file with '#!/usr/bin/env qmap' on line one
+                # need not be named .py.
+                if [ -f "$a" ] && head -1 "$a" 2>/dev/null | grep -q 'qmap'; then
+                    exec python3 "$JOBFILE_RUNNER" "$@"
+                fi ;;
+        esac
+    done
+fi
+
+# ------------------------------------------------------------- subcommands
+case ${1:-} in
+    register)
+        shift
+        [ $# -gt 0 ] || die "register needs a name"
+        name=$1; shift
+        check_name "$name"
+        # --note is a comment kept with the template, not an option to replay.
+        NOTE=; FROM=
+        RARGS=(); NR=0
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --note) [ $# -ge 2 ] || die "--note needs text"; NOTE=$2; shift 2 ;;
+                --note=*) NOTE=${1#*=}; shift ;;
+                --from) [ $# -ge 2 ] || die "--from needs a file ('-' for stdin)"; FROM=$2; shift 2 ;;
+                --from=*) FROM=${1#*=}; shift ;;
+                *) RARGS[NR]=$1; NR=$((NR+1)); shift ;;
+            esac
+        done
+        if [ -n "$FROM" ]; then
+            [ "$FROM" = "-" ] || [ -f "$FROM" ] || die "no such file: $FROM"
+            read_directives "$FROM"
+            # A job name belongs to the job, not to a set of cluster settings,
+            # so it is left behind when a block becomes a template.
+            FARGS=(); NF=0; skip=0
+            for o in ${OPTS[@]+"${OPTS[@]}"}; do
+                if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+                if [ "$o" = "--name" ]; then skip=1; continue; fi
+                FARGS[NF]=$o; NF=$((NF+1))
+            done
+            # Options read from the block first, so anything typed here wins.
+            set -- ${FARGS[@]+"${FARGS[@]}"} ${RARGS[@]+"${RARGS[@]}"}
+        else
+            set -- ${RARGS[@]+"${RARGS[@]}"}
+        fi
+        [ $# -gt 0 ] || die "register needs at least one option to save"
+        for a in "$@"; do
+            [ "$a" = "--" ] && die "a template holds submission options only, not a command"
+        done
+        # Catch a typo now rather than at the next submission.
+        for a in "$@"; do
+            case $a in
+                -*) case " $(printf '%s' "$KNOWN_FLAGS" | tr '\n' ' ') " in
+                        *" ${a%%=*} "*) ;;
+                        *) die "unknown option '$a'; see --help" ;;
+                    esac ;;
+            esac
+        done
+        mkdir -p "$USER_TPL_DIR"
+        f=$USER_TPL_DIR/$name.args
+        { printf '# qmap template %s, registered %s\n' "$name" "$(date)"
+          [ -n "$NOTE" ] && printf '%s\n' "$NOTE" | sed -e '1s/^/# note: /' -e '2,$s/^/#       /'
+          printf '# One argument per line. Edit freely, or re-register to replace.\n'
+          printf '%s\n' "$@"; } > "$f"
+        printf 'registered %s -> %s\n' "$name" "$f"
+        exit 0 ;;
+    templates)
+        found=0
+        for d in $TPL_DIRS; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*.args; do
+                [ -f "$f" ] || continue
+                found=1
+                n=$(basename "$f" .args)
+                printf '%-20s %s\n' "$n" "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^$' | tr '\n' ' ')"
+                sed -n 's/^# note: /  note: /p;s/^#       /        /p' "$f"
+            done
+        done
+        [ "$found" -eq 1 ] || printf 'no templates yet; register one with: %s register NAME [options]\n' "$PROG"
+        exit 0 ;;
+    show)
+        [ $# -ge 2 ] || die "show needs a name"
+        f=$(tpl_file "$2") || die "no template '$2'"
+        printf '# %s\n' "$f"; cat "$f"; exit 0 ;;
+    forget)
+        [ $# -ge 2 ] || die "forget needs a name"
+        check_name "$2"
+        f=$USER_TPL_DIR/$2.args
+        [ -f "$f" ] || die "no template '$2' in $USER_TPL_DIR (templates shipped in $SELF_DIR/templates are not removed this way)"
+        rm -- "$f"; printf 'forgot %s\n' "$2"; exit 0 ;;
+    convert)
+        # Read one scheduler's directives, print the other's.
+        shift
+        SRC=; TGT=; CARGS=(); NCA=0
+        BOOLS=" --dry-run --stdin --no-module --no-modules "
+        while [ $# -gt 0 ]; do
+            case $1 in
+                lsf | slurm) TGT=$1 ;;
+                -) SRC=- ;;
+                *=*) CARGS[NCA]=$1; NCA=$((NCA+1)) ;;
+                -*)
+                    CARGS[NCA]=$1; NCA=$((NCA+1))
+                    case $BOOLS in
+                        *" $1 "*) ;;
+                        *) if [ $# -ge 2 ]; then CARGS[NCA]=$2; NCA=$((NCA+1)); shift; fi ;;
+                    esac ;;
+                *) SRC=$1 ;;
+            esac
+            shift
+        done
+        [ -n "$SRC" ] || SRC=-
+        [ "$SRC" = "-" ] || [ -f "$SRC" ] || die "no such file: $SRC"
+        read_directives "$SRC"
+        # With no target named, convert to the other scheduler.
+        if [ -z "$TGT" ]; then
+            case ${OPTS[1]} in
+                lsf) TGT=slurm ;;
+                *) TGT=lsf ;;
+            esac
+        fi
+        MODE=directives
+        set -- ${OPTS[@]+"${OPTS[@]}"} --scheduler "$TGT" ${CARGS[@]+"${CARGS[@]}"} ;;
+    directives | header)
+        # Render a template's scheduler directives, optionally as the other
+        # scheduler's. Positional arguments are a template name and lsf|slurm.
+        shift
+        MODE=directives
+        DARGS=(); ND=0
+        # Flags that take no value; every other flag swallows the next argument,
+        # so a value like 24:00:00 is never mistaken for a template name.
+        BOOLS=" --dry-run --stdin --no-module --no-modules "
+        while [ $# -gt 0 ]; do
+            case $1 in
+                lsf | slurm) DARGS[ND]=--scheduler; DARGS[$((ND+1))]=$1; ND=$((ND+2)) ;;
+                *=*) DARGS[ND]=$1; ND=$((ND+1)) ;;
+                -*)
+                    DARGS[ND]=$1; ND=$((ND+1))
+                    case $BOOLS in
+                        *" $1 "*) ;;
+                        *) if [ $# -ge 2 ]; then DARGS[ND]=$2; ND=$((ND+1)); shift; fi ;;
+                    esac ;;
+                *) DARGS[ND]=--template; DARGS[$((ND+1))]=$1; ND=$((ND+2)) ;;
+            esac
+            shift
+        done
+        set -- ${DARGS[@]+"${DARGS[@]}"} ;;
+    --help | -h) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+esac
+
+# ------------------------------------------------------------------ defaults
+MODE=${MODE:-submit}
+NAME= SCHED=auto SCHED_SRC= CONCURRENCY= GPUS=0 CORES= CORES_PER_GPU= NODES=
+WALLTIME= MEM= QUEUE= QOS= ACCOUNT= CONSTRAINT= LOGDIR=
+CONDA_ENV= CHDIR=$PWD DONE_WHEN= DRYRUN=0 TPL_USED=
+MODULES=() EXPORTS=() SETUP=() DIRECTIVES=() SPECS=() CMD=()
+NMOD=0 NEXP=0 NSET=0 NDIR=0 NSPEC=0 NCMD=0
+
+# ------------------------------------------------- splice in any --template
+# Done before parsing, so a template's options behave exactly as if typed at
+# that spot: whatever follows overrides them, and repeatable options like
+# --module accumulate in order.
+EXP=(); NEXPD=0
+expand_args() {
+    local depth=$1; shift
+    [ "$depth" -gt 8 ] && die "--template nesting too deep (a loop?)"
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --)
+                while [ $# -gt 0 ]; do EXP[NEXPD]=$1; NEXPD=$((NEXPD+1)); shift; done
+                return ;;
+            --template | -T | --template=*)
+                local nm
+                case $1 in
+                    --template=*) nm=${1#*=}; shift ;;
+                    *) [ $# -ge 2 ] || die "$1 needs a template name"; nm=$2; shift 2 ;;
+                esac
+                tpl_load "$nm"
+                local nested=( ${TPL_ARGS[@]+"${TPL_ARGS[@]}"} )
+                TPL_USED="$TPL_USED $nm"
+                expand_args $((depth + 1)) ${nested[@]+"${nested[@]}"} ;;
+            *) EXP[NEXPD]=$1; NEXPD=$((NEXPD+1)); shift ;;
+        esac
+    done
+}
+expand_args 0 "$@"
+set -- ${EXP[@]+"${EXP[@]}"}
+
+# ------------------------------------------------------------------ arguments
+while [ $# -gt 0 ]; do
+    case $1 in
+        --inputs)  SPECS[NSPEC]="glob:$2"; NSPEC=$((NSPEC+1)); shift 2 ;;
+        --list)    SPECS[NSPEC]="file:$2"; NSPEC=$((NSPEC+1)); shift 2 ;;
+        --input)   SPECS[NSPEC]="lit:$2";  NSPEC=$((NSPEC+1)); shift 2 ;;
+        --stdin)   SPECS[NSPEC]="stdin:";  NSPEC=$((NSPEC+1)); shift ;;
+        --name)    NAME=$2; shift 2 ;;
+        --gpu|--gpus) GPUS=$2; shift 2 ;;
+        --cores) CORES=$2; shift 2 ;;
+        --cores-per-gpu) CORES_PER_GPU=$2; shift 2 ;;
+        --nodes)   NODES=$2; shift 2 ;;
+        --walltime) WALLTIME=$2; shift 2 ;;
+        --mem)     MEM=$2; shift 2 ;;
+        --queue) QUEUE=$2; shift 2 ;;
+        --qos)     QOS=$2; shift 2 ;;
+        --account) ACCOUNT=$2; shift 2 ;;
+        --constraint) CONSTRAINT=$2; shift 2 ;;
+        --concurrency) CONCURRENCY=$2; shift 2 ;;
+        --directive) DIRECTIVES[NDIR]=$2; NDIR=$((NDIR+1)); shift 2 ;;
+        --conda|--env) CONDA_ENV=$2; shift 2 ;;
+        --module)  MODULES[NMOD]=$2; NMOD=$((NMOD+1)); shift 2 ;;
+        --no-module|--no-modules) MODULES=(); NMOD=0; shift ;;
+        --export)  EXPORTS[NEXP]=$2; NEXP=$((NEXP+1)); shift 2 ;;
+        --setup)   SETUP[NSET]=$2; NSET=$((NSET+1)); shift 2 ;;
+        --chdir)   CHDIR=$2; shift 2 ;;
+        --done-when) DONE_WHEN=$2; shift 2 ;;
+        --logdir)  LOGDIR=$2; shift 2 ;;
+        --scheduler)
+            [ -n "$SCHED_SRC" ] || SCHED_SRC=$2      # the first one: a template's
+            SCHED=$2; shift 2 ;;
+        --dry-run) DRYRUN=1; shift ;;
+        --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        --help|-h) usage; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do CMD[NCMD]=$1; NCMD=$((NCMD+1)); shift; done; break ;;
+        *) die "unknown option '$1' (the command goes after --; see --help)" ;;
+    esac
+done
+
+if [ "$MODE" != directives ]; then
+    [ "$NCMD" -gt 0 ] || die "no command: put it after --"
+    [ "$NSPEC" -gt 0 ] || die "no inputs: use --inputs, --list, --input or --stdin"
+fi
+
+case $SCHED in
+    auto)
+        if command -v sbatch >/dev/null 2>&1; then SCHED=slurm
+        elif command -v bsub >/dev/null 2>&1; then SCHED=lsf
+        else die "neither sbatch nor bsub on PATH; pass --scheduler lsf|slurm (with --dry-run to just generate)"; fi ;;
+    lsf|slurm) ;;
+    *) die "--scheduler must be lsf, slurm or auto" ;;
+esac
+
+if [ -z "$NAME" ]; then
+    if [ "$NCMD" -gt 0 ]; then
+        NAME=$(basename -- "${CMD[0]}")
+    else
+        # No command to name it after: the first template, else something plain.
+        NAME=$(printf '%s' "${TPL_USED# }" | cut -d' ' -f1)
+        [ -n "$NAME" ] || NAME=job
+    fi
+fi
+case $NAME in
+    [A-Za-z_]*) [ -z "$(printf '%s' "$NAME" | tr -d 'A-Za-z0-9_.-')" ] ||
+        die "job name '$NAME' may hold only letters, digits, . _ -" ;;
+    *) die "job name '$NAME' must start with a letter or underscore" ;;
+esac
+[ -n "$LOGDIR" ] || LOGDIR=logs_$NAME
+
+WALLTIME_UNITS=0
+if [ -n "$WALLTIME" ]; then
+    if WT_MIN=$(units_to_min "$WALLTIME"); then
+        WALLTIME_UNITS=1
+        if [ "$SCHED" = slurm ]; then
+            WALLTIME=$(printf '%d:%02d:00' $((WT_MIN / 60)) $((WT_MIN % 60)))
+        else
+            WALLTIME=$(printf '%d:%02d' $((WT_MIN / 60)) $((WT_MIN % 60)))
+        fi
+    fi
+fi
+
+# --cores-per-gpu only does anything when a GPU count was asked for and no
+# explicit --cores overrides it.
+if [ -z "$CORES" ] && [ -n "$CORES_PER_GPU" ] && [ "${GPUS:-0}" != 0 ]; then
+    case $CORES_PER_GPU in
+        '' | *[!0-9]*) die "--cores-per-gpu must be a whole number, got '$CORES_PER_GPU'" ;;
+    esac
+    CORES=$((GPUS * CORES_PER_GPU))
+fi
+for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "concurrency:$CONCURRENCY"; do
+    v=${pair#*:}
+    [ -n "$v" ] || continue
+    case $v in ''|*[!0-9]*) die "--${pair%%:*} must be a whole number, got '$v'" ;; esac
+done
+# Plain if/else: a failing test inside a command substitution would make the
+# assignment itself fail, and set -e would end the run right here.
+if [ -n "$SCHED_SRC" ] && [ "$SCHED_SRC" != "$SCHED" ] && [ -n "$WALLTIME" ] \
+        && [ "$WALLTIME_UNITS" -eq 0 ]; then
+    warn "walltime '$WALLTIME' was written for $SCHED_SRC and is being rendered for $SCHED;
+       LSF reads [hh]:mm while Slurm reads [d-]hh:mm:ss (to Slurm, '24:00' is 24 minutes).
+       Check it before using this."
+fi
+
+TPL_NOTE=
+if [ -n "$TPL_USED" ]; then
+    if [ "$(printf '%s' "$TPL_USED" | wc -w)" -gt 1 ]; then
+        TPL_NOTE=", templates:$TPL_USED"
+    else
+        TPL_NOTE=", template:$TPL_USED"
+    fi
+fi
+
+# ------------------------------------------------------------- directives
+# Only what was asked for: no account, queue, walltime or core count appears
+# here unless it came from the command line or a template.
+HDR=(); NH=0
+hdr() { HDR[NH]=$1; NH=$((NH+1)); }
+build_header() {
+    if [ "$SCHED" = slurm ]; then
+        hdr "#SBATCH -J $NAME"
+        [ -n "$ACCOUNT" ] && hdr "#SBATCH -A $ACCOUNT"
+        [ -n "$QUEUE" ] && hdr "#SBATCH -p $QUEUE"
+        [ -n "$QOS" ] && hdr "#SBATCH -q $QOS"
+        [ -n "$NODES" ] && hdr "#SBATCH -N $NODES"
+        [ -n "$CORES" ] && { hdr "#SBATCH -n 1"; hdr "#SBATCH -c $CORES"; }
+        [ "${GPUS:-0}" != 0 ] && hdr "#SBATCH --gres=gpu:$GPUS"
+        [ -n "$CONSTRAINT" ] && hdr "#SBATCH -C $CONSTRAINT"
+        [ -n "$MEM" ] && hdr "#SBATCH --mem=$MEM"
+        [ -n "$WALLTIME" ] && hdr "#SBATCH -t $WALLTIME"
+        hdr "#SBATCH -o $LOGDIR/%A_%a.out"; hdr "#SBATCH -e $LOGDIR/%A_%a.err"
+        hdr "#SBATCH --array=1-$N${CONCURRENCY:+%$CONCURRENCY}"
+        for d in ${DIRECTIVES[@]+"${DIRECTIVES[@]}"}; do hdr "#SBATCH $d"; done
+    else
+        hdr "#BSUB -J \"$NAME[1-$N]${CONCURRENCY:+%$CONCURRENCY}\""
+        [ -n "$QUEUE" ] && hdr "#BSUB -q $QUEUE"
+        if [ -n "$QOS" ]; then
+            # Converting may lose what LSF has no equivalent for, as long as it
+            # says so; submitting with a flag that would vanish may not.
+            if [ "$MODE" = directives ]; then
+                warn "dropped --qos $QOS: LSF has no QOS"
+            else
+                die "LSF has no QOS; --qos is Slurm-only (use --directive for an LSF equivalent)"
+            fi
+        fi
+        [ -n "$ACCOUNT" ] && hdr "#BSUB -P $ACCOUNT"
+        if [ -n "$CORES" ]; then
+            hdr "#BSUB -n $CORES"
+            # span[hosts=1] only means anything once more than one slot is asked for.
+            [ "$CORES" -gt 1 ] && hdr "#BSUB -R \"span[hosts=1]\""
+        fi
+        [ -n "$CONSTRAINT" ] && hdr "#BSUB -R $CONSTRAINT"
+        [ -n "$MEM" ] && hdr "#BSUB -R \"rusage[mem=$MEM]\""
+        [ "${GPUS:-0}" != 0 ] && hdr "#BSUB -gpu \"num=$GPUS:mode=exclusive_process\""
+        [ -n "$WALLTIME" ] && hdr "#BSUB -W $WALLTIME"
+        hdr "#BSUB -o $LOGDIR/%J_%I.out"; hdr "#BSUB -e $LOGDIR/%J_%I.err"
+        # The generated script is bash; without this LSF would run it under the
+        # submitter's login shell.
+        hdr "#BSUB -L /bin/bash"
+        for d in ${DIRECTIVES[@]+"${DIRECTIVES[@]}"}; do hdr "#BSUB $d"; done
+    fi
+}
+
+if [ "$MODE" = directives ]; then
+    # N is symbolic here: the array range is only known at submission.
+    N=N
+    [ -n "$LOGDIR" ] || LOGDIR=logs_$NAME
+
+WALLTIME_UNITS=0
+if [ -n "$WALLTIME" ]; then
+    if WT_MIN=$(units_to_min "$WALLTIME"); then
+        WALLTIME_UNITS=1
+        if [ "$SCHED" = slurm ]; then
+            WALLTIME=$(printf '%d:%02d:00' $((WT_MIN / 60)) $((WT_MIN % 60)))
+        else
+            WALLTIME=$(printf '%d:%02d' $((WT_MIN / 60)) $((WT_MIN % 60)))
+        fi
+    fi
+fi
+    build_header
+    printf '%s\n' "${HDR[@]}"
+    printf '# job name, log paths and the 1-N array range are filled in per submission\n'
+    exit 0
+fi
+
+# --------------------------------------------------------------- input list
+shopt -s nullglob
+INPUTS=(); N=0
+add_input() { INPUTS[N]=$1; N=$((N+1)); }
+read_lines() {   # strip blanks and comments so a list file can be annotated
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in ''|\#*) continue ;; esac
+        add_input "$line"
+    done
+}
+for spec in "${SPECS[@]}"; do
+    kind=${spec%%:*}; val=${spec#*:}
+    case $kind in
+        glob)
+            # Emptying IFS first: the pattern still undergoes pathname
+            # expansion, but is not word-split, so a glob like
+            # 'some dir/*.mae' survives its space. (eval would split it, and
+            # would also run whatever the pattern happened to contain.)
+            case $val in "~/"*) val=$HOME/${val#\~/} ;; esac
+            hits=()
+            ja_ifs=$IFS; IFS=
+            hits=( $val )
+            IFS=$ja_ifs
+            [ ${#hits[@]} -gt 0 ] || warn "glob matched nothing: $val"
+            for h in ${hits[@]+"${hits[@]}"}; do add_input "$h"; done ;;
+        file)
+            [ -r "$val" ] || die "cannot read list file: $val"
+            read_lines < "$val" ;;
+        stdin) read_lines ;;
+        lit) add_input "$val" ;;
+    esac
+done
+[ "$N" -gt 0 ] || die "input list is empty"
+
+# --------------------------------------------------------------- templating
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+NVAR=0; NPRE=0; PRE=(); EKEYS=(); EVARS=(); NEK=0; USE_FIELDS=0
+
+add_pre() { PRE[NPRE]=$1; NPRE=$((NPRE+1)); }
+
+lookup_expr() {
+    i=0
+    while [ $i -lt $NEK ]; do
+        [ "${EKEYS[i]}" = "$1" ] && { printf '%s' "${EVARS[i]}"; return 0; }
+        i=$((i+1))
+    done
+    return 1
+}
+
+# These three return through globals rather than echoing: a command
+# substitution would run them in a subshell, and the PRE lines and USE_FIELDS
+# they collect along the way would be thrown away with it.
+
+# A path-valued expression, as shell that evaluates to that path. -> PC_OUT
+PC_OUT=
+path_code() {
+    local inner
+    case $1 in
+        input) PC_OUT='"$INPUT"' ;;
+        [0-9]|[0-9][0-9]) USE_FIELDS=1; PC_OUT="\"\${JA_F[$1]}\"" ;;
+        *.parent)
+            path_code "${1%.parent}"; inner=$PC_OUT
+            PC_OUT="\"\$(dirname -- $inner)\"" ;;
+        *) die "cannot take a path from {$1}" ;;
+    esac
+}
+
+# One {...} token, as the shell expansion to drop in its place. -> VC_OUT
+# Anything needing computation becomes a JA_n set once at the top of the task.
+VC_OUT=
+value_code() {
+    local tok=$1 e spec v key base
+    e=${tok%%:*}
+    if [ "$tok" = "$e" ]; then spec=; else spec=${tok#*:}; fi
+    [ -n "$e" ] || e=input
+
+    if [ -n "$spec" ]; then
+        case $e in
+            index|i|n) ;;
+            *) die "a format spec ({$tok}) works only on {index} and {n}" ;;
+        esac
+        case $spec in
+            *d) case ${spec%d} in ''|*[!0-9]*) die "unsupported format spec ':$spec'; try :04d" ;; esac ;;
+            *) die "unsupported format spec ':$spec'; only integer specs like :04d" ;;
+        esac
+    fi
+
+    key=$tok
+    if v=$(lookup_expr "$key"); then VC_OUT="\${$v}"; return; fi
+
+    case $e in
+        index|i) base='${IDX}' ;;
+        n)       base='${N}' ;;
+        input)   base='${INPUT}' ;;
+        [0-9]|[0-9][0-9]) USE_FIELDS=1; base="\${JA_F[$e]}" ;;
+        *.name|*.stem|*.suffix|*.parent) base= ;;
+        stem|dir|base|name|suffix|parent)
+            die "{$e} is not a placeholder; write {input.$e} (or {1.$e} for a field)" ;;
+        *) die "unknown placeholder {$tok}; see --help for the list" ;;
+    esac
+
+    if [ -z "$spec" ] && [ -n "$base" ]; then VC_OUT=$base; return; fi
+
+    NVAR=$((NVAR+1)); v=JA_$NVAR
+    if [ -n "$spec" ]; then
+        add_pre "$v=\$(printf '%${spec}' \"$base\")"
+    else
+        case $e in
+            *.parent)
+                path_code "${e%.parent}"
+                add_pre "$v=\$(dirname -- $PC_OUT)" ;;
+            *.name)
+                path_code "${e%.name}"
+                add_pre "$v=\$(basename -- $PC_OUT)" ;;
+            *.stem)
+                path_code "${e%.stem}"
+                add_pre "$v=\$(basename -- $PC_OUT)"
+                add_pre "$v=\${$v%.*}" ;;
+            *.suffix)
+                path_code "${e%.suffix}"
+                add_pre "$v=\$(basename -- $PC_OUT)"
+                add_pre "case \$$v in *.*) $v=.\${$v##*.} ;; *) $v= ;; esac" ;;
+        esac
+    fi
+    EKEYS[NEK]=$key; EVARS[NEK]=$v; NEK=$((NEK+1))
+    VC_OUT="\${$v}"
+}
+
+# One argument of the command line, quoted for the generated script. -> RENDER_OUT
+# Plain words are left bare so the script reads like hand-written shell,
+# anything else is single-quoted, and an argument holding a {...} becomes a
+# double-quoted string so its substituted variables expand.
+#
+# Braces follow Python: {{ and }} are literal braces, which is how a payload
+# like awk '{{print $1}}' gets through. A ${VAR} is passed along untouched and
+# resolves in the task's own environment.
+RENDER_OUT=
+RA_OUT=
+ra_append() {   # one character, escaped for the double-quoted string
+    case $1 in
+        '\' | '"' | '$' | '`') RA_OUT=$RA_OUT'\'$1 ;;
+        *) RA_OUT=$RA_OUT$1 ;;
+    esac
+}
+render() {
+    local a=$1 rest tok ch
+    case $a in
+        *'{'* | *'}'*) ;;
+        *)
+            case $a in
+                '' | *[!A-Za-z0-9_./=:,@%+-]*) RENDER_OUT=$(sq "$a") ;;
+                *) RENDER_OUT=$a ;;
+            esac
+            return ;;
+    esac
+    RA_OUT=; rest=$a
+    while [ -n "$rest" ]; do
+        case $rest in
+            '{{'*) RA_OUT=$RA_OUT'{'; rest=${rest#??} ;;
+            '}}'*) RA_OUT=$RA_OUT'}'; rest=${rest#??} ;;
+            '${'*)
+                case $rest in *'}'*) ;; *) die "unclosed \${ in: $1" ;; esac
+                tok=${rest%%\}*}; rest=${rest#*\}}
+                RA_OUT=$RA_OUT$tok'}' ;;
+            '{'*)
+                rest=${rest#\{}
+                case $rest in *'}'*) ;; *) die "unclosed { in: $1 (write {{ for a literal brace)" ;; esac
+                tok=${rest%%\}*}; rest=${rest#*\}}
+                case $tok in *'{'*) die "nested { in: $1" ;; esac
+                value_code "$tok"
+                RA_OUT=$RA_OUT$VC_OUT ;;
+            '}'*) die "unmatched } in: $1 (write }} for a literal brace)" ;;
+            *)
+                ch=${rest%"${rest#?}"}
+                ra_append "$ch"; rest=${rest#?} ;;
+        esac
+    done
+    RENDER_OUT="\"$RA_OUT\""
+}
+
+# Render before touching the filesystem: this is where a bad placeholder is
+# caught, and it fills PRE as a side effect.
+CMD_R=(); i=0
+while [ $i -lt $NCMD ]; do
+    render "${CMD[i]}"; CMD_R[i]=$RENDER_OUT; i=$((i+1))
+done
+DONE_R=
+if [ -n "$DONE_WHEN" ]; then
+    render "$DONE_WHEN"; DONE_R=$RENDER_OUT
+    # eval needs it as one word even when it held no placeholder.
+    case $DONE_R in '"'*|"'"*) ;; *) DONE_R=$(sq "$DONE_WHEN") ;; esac
+fi
+
+# ------------------------------------------------------------- artifact dir
+STAMP=$(date +%Y%m%d-%H%M%S)
+RUNDIR=.qmap/$NAME-$STAMP
+mkdir -p "$RUNDIR" "$LOGDIR"
+# A fresh list per submission on purpose: the running array reads its own list
+# lazily, so overwriting one shared file would rewrite a live job's inputs.
+LIST=$(cd "$RUNDIR" && pwd)/inputs.txt
+printf '%s\n' "${INPUTS[@]}" > "$LIST"
+SCRIPT=$RUNDIR/job.sh
+
+build_header
+
+# ---------------------------------------------------------------- the script
+{
+    printf '#!/usr/bin/env bash\n'
+    printf '# Generated by %s %s on %s\n' "$PROG" "$VERSION" "$(date)"
+    printf '# %d tasks, %s%s. Edit and resubmit this file directly if you need\n' \
+        "$N" "$SCHED" "$TPL_NOTE"
+    printf '# something qmap has no flag for.\n'
+    printf '%s\n' "${HDR[@]}"
+    printf '\nset -euo pipefail\n\n'
+    printf '# Read from whichever scheduler started us, so this file runs under either.\n'
+    printf 'IDX="${SLURM_ARRAY_TASK_ID:-${LSB_JOBINDEX:-}}"\n'
+    printf '[ -n "$IDX" ] || { echo "not running as an array task" >&2; exit 1; }\n'
+    printf 'N=%d\n' "$N"
+    printf 'LIST=%s\n\n' "$(sq "$LIST")"
+    printf 'cd %s\n\n' "$(sq "$CHDIR")"
+    printf 'INPUT=$(sed -n "${IDX}p" "$LIST")\n'
+    printf '[ -n "$INPUT" ] || { echo "no line $IDX in $LIST" >&2; exit 1; }\n'
+    [ "$USE_FIELDS" -eq 1 ] && {
+        printf '# {0}, {1}, ... : the line split on whitespace.\n'
+        printf 'read -r -a JA_F <<< "$INPUT"\n'
+    }
+    if [ "$NPRE" -gt 0 ]; then
+        printf '\n# Values for the placeholders used below.\n'
+        printf '%s\n' "${PRE[@]}"
+    fi
+    printf '\necho "[$IDX/$N] $INPUT"\n'
+    printf 'hostname\n'
+    [ "$GPUS" -gt 0 ] && printf 'nvidia-smi -L || true\n'
+    printf '\n'
+    if [ "$NMOD" -gt 0 ]; then
+        for m in "${MODULES[@]}"; do printf 'module load %s\n' "$m"; done
+        printf '\n'
+    fi
+    if [ -n "$CONDA_ENV" ]; then
+        printf '# conda activate is a shell function, and does not exist in a batch shell\n'
+        printf '# until this profile script is sourced.\n'
+        printf 'source "$(conda info --base)/etc/profile.d/conda.sh"\n'
+        printf 'conda activate %s\n\n' "$(sq "$CONDA_ENV")"
+    fi
+    printf '# Python block-buffers stdout when it is not a terminal, so without this the\n'
+    printf '# log stays empty for hours and then arrives all at once.\n'
+    printf 'export PYTHONUNBUFFERED=1\n'
+    for e in ${EXPORTS[@]+"${EXPORTS[@]}"}; do
+        printf 'export %s=%s\n' "${e%%=*}" "$(sq "${e#*=}")"
+    done
+    printf '\n'
+    if [ "$NSET" -gt 0 ]; then printf '%s\n' "${SETUP[@]}"; printf '\n'; fi
+    if [ -n "$DONE_WHEN" ]; then
+        printf '# --done-when: skip inputs that are already finished, so resubmitting this\n'
+        printf '# array picks up only the work still outstanding.\n'
+        printf 'if eval %s; then echo "already done, skipping: $INPUT"; exit 0; fi\n\n' "$DONE_R"
+    fi
+    printf 'exec %s' "${CMD_R[0]}"
+    i=1
+    while [ $i -lt $NCMD ]; do printf ' \\\n    %s' "${CMD_R[i]}"; i=$((i+1)); done
+    printf '\n'
+} > "$SCRIPT"
+chmod +x "$SCRIPT"
+
+# -------------------------------------------------------------------- submit
+if [ "$DRYRUN" -eq 1 ]; then
+    cat "$SCRIPT"
+    printf '\n%s: dry run. script %s, list %s (%d inputs). Nothing submitted.\n' \
+        "$PROG" "$SCRIPT" "$LIST" "$N" >&2
+    exit 0
+fi
+
+printf '%s: %d tasks%s, %s%s\n' "$PROG" "$N" \
+    "${CONCURRENCY:+, $CONCURRENCY at a time}" "$SCHED" "$TPL_NOTE"
+printf '  first: %s\n  last:  %s\n' "${INPUTS[0]}" "${INPUTS[N-1]}"
+printf '  script %s\n  logs   %s/\n' "$SCRIPT" "$LOGDIR"
+
+if [ "$SCHED" = slurm ]; then
+    sbatch "$SCRIPT"
+else
+    bsub < "$SCRIPT"
+fi

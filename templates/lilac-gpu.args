@@ -1,0 +1,11 @@
+# Lilac (MSKCC) gpuqueue, one A100. Walltime stays a per-job decision.
+--scheduler
+lsf
+--queue
+gpuqueue
+--constraint
+A100
+--cores-per-gpu
+4
+--module
+cuda/12.2

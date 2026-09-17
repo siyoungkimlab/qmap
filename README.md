@@ -167,7 +167,13 @@ qmap --template Gautschi_H100_1GPU_4h --account other --cores 8 ...
 ```
 
 Repeatable options (`--module`, `--directive`, `--setup`, `--export`)
-accumulate; `--no-module` clears the modules a template would load. Templates
+accumulate; `--no-module` clears the modules a template would load. **An empty
+value clears anything else a template set**, which is how you drop a
+constraint rather than replace it:
+
+```bash
+qmap --template Lilac_A100_1GPU_4h --constraint '' ...   # any free GPU host
+``` Templates
 may reference other templates, so a personal one can build on a cluster one:
 
 ```bash

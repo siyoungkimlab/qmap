@@ -101,6 +101,9 @@ Submission parameters (all optional; omitted from the script when not given)
   --name NAME          job name (default: the command's basename)
   --gpu N              GPUs per task
   --cores N            cores per task
+  --tasks N            tasks per array element (Slurm -n; default 1). Only
+                       useful when the command starts them itself, with srun,
+                       MPI or a worker pool
   --cores-per-gpu N    derive --cores from --gpu when --cores is not given
   --nodes N            nodes per task
   --walltime T         4h, 90m, 2d12h — units are converted to whichever form
@@ -132,7 +135,7 @@ USAGE
 }
 
 KNOWN_FLAGS="--inputs --list --input --stdin --name --gpu --gpus --cores -c
---cores-per-gpu --nodes --walltime --mem --queue --qos --account
+--cores-per-gpu --tasks --nodes --walltime --mem --queue --qos --account
 --constraint --concurrency --directive --conda --env --module --no-module
 --no-modules --export --setup --chdir --done-when --logdir
 --scheduler --template -T --dry-run"
@@ -394,7 +397,7 @@ esac
 # ------------------------------------------------------------------ defaults
 MODE=${MODE:-submit}
 NAME= SCHED=auto SCHED_SRC= CONCURRENCY= GPUS=0 CORES= CORES_PER_GPU= NODES=
-WALLTIME= MEM= QUEUE= QOS= ACCOUNT= CONSTRAINT= LOGDIR=
+WALLTIME= MEM= QUEUE= QOS= ACCOUNT= CONSTRAINT= LOGDIR= TASKS=
 CONDA_ENV= CHDIR=$PWD DONE_WHEN= DRYRUN=0 TPL_USED=
 MODULES=() EXPORTS=() SETUP=() DIRECTIVES=() SPECS=() CMD=()
 NMOD=0 NEXP=0 NSET=0 NDIR=0 NSPEC=0 NCMD=0
@@ -439,6 +442,7 @@ while [ $# -gt 0 ]; do
         --name)    NAME=$2; shift 2 ;;
         --gpu|--gpus) GPUS=$2; shift 2 ;;
         --cores) CORES=$2; shift 2 ;;
+        --tasks) TASKS=$2; shift 2 ;;
         --cores-per-gpu) CORES_PER_GPU=$2; shift 2 ;;
         --nodes)   NODES=$2; shift 2 ;;
         --walltime) WALLTIME=$2; shift 2 ;;
@@ -518,7 +522,7 @@ if [ -z "$CORES" ] && [ -n "$CORES_PER_GPU" ] && [ "${GPUS:-0}" != 0 ]; then
     esac
     CORES=$((GPUS * CORES_PER_GPU))
 fi
-for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "concurrency:$CONCURRENCY"; do
+for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "tasks:$TASKS" "concurrency:$CONCURRENCY"; do
     v=${pair#*:}
     [ -n "$v" ] || continue
     case $v in ''|*[!0-9]*) die "--${pair%%:*} must be a whole number, got '$v'" ;; esac
@@ -553,7 +557,12 @@ build_header() {
         [ -n "$QUEUE" ] && hdr "#SBATCH -p $QUEUE"
         [ -n "$QOS" ] && hdr "#SBATCH -q $QOS"
         [ -n "$NODES" ] && hdr "#SBATCH -N $NODES"
-        [ -n "$CORES" ] && { hdr "#SBATCH -n 1"; hdr "#SBATCH -c $CORES"; }
+        # One task per array element unless --tasks says otherwise; that only
+        # makes sense when the payload starts them itself (srun, MPI, a pool).
+        if [ -n "$CORES" ] || [ -n "$TASKS" ]; then
+            hdr "#SBATCH -n ${TASKS:-1}"
+            [ -n "$CORES" ] && hdr "#SBATCH -c $CORES"
+        fi
         [ "${GPUS:-0}" != 0 ] && hdr "#SBATCH --gres=gpu:$GPUS"
         [ -n "$CONSTRAINT" ] && hdr "#SBATCH -C $CONSTRAINT"
         [ -n "$MEM" ] && hdr "#SBATCH --mem=$MEM"
@@ -574,10 +583,12 @@ build_header() {
             fi
         fi
         [ -n "$ACCOUNT" ] && hdr "#BSUB -P $ACCOUNT"
-        if [ -n "$CORES" ]; then
-            hdr "#BSUB -n $CORES"
+        if [ -n "$CORES" ] || [ -n "$TASKS" ]; then
+            # LSF counts slots, so tasks x cores is what to ask for.
+            LSF_SLOTS=$(( ${TASKS:-1} * ${CORES:-1} ))
+            hdr "#BSUB -n $LSF_SLOTS"
             # span[hosts=1] only means anything once more than one slot is asked for.
-            [ "$CORES" -gt 1 ] && hdr "#BSUB -R \"span[hosts=1]\""
+            [ "$LSF_SLOTS" -gt 1 ] && hdr "#BSUB -R \"span[hosts=1]\""
         fi
         [ -n "$CONSTRAINT" ] && hdr "#BSUB -R $CONSTRAINT"
         [ -n "$MEM" ] && hdr "#BSUB -R \"rusage[mem=$MEM]\""

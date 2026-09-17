@@ -278,8 +278,8 @@ def parse_slurm(tokens, out, extra):
             if m:
                 out["--concurrency"] = m.group(1)
         elif t in ("-n", "--ntasks"):
-            if value != "1":
-                extra.append(f"{t} {value}")   # one task per array element is the shape
+            if value != "1":                  # 1 is qmap's default shape
+                keep(out, "--tasks", value, t)
         elif t in ("-o", "--output", "-e", "--error"):
             pass
         elif t.startswith("--mail"):

@@ -293,6 +293,41 @@ it with units and qmap renders the right form for whichever scheduler:
 A bare `24:00` is still passed through exactly as typed, and converting a
 template that carries one warns rather than reinterpreting it.
 
+### Cores, tasks and workers
+
+Say you want 64 CPUs' worth of work, as 16 workers of 4 CPUs each. There are
+two different jobs hiding in that sentence.
+
+**16 array tasks at a time, 4 cores each.** The workers are independent, each
+handling one input, and the scheduler starts them wherever there is room:
+
+```bash
+qmap --cores 4 --concurrency 16 --inputs 'data/*.pdb' -- analyse {input}
+```
+
+Nothing asks for 64 cores; 16 × 4 are simply in flight at once. This is what a
+job array is for, it starts as soon as any 4 cores are free, and a worker that
+dies takes one input down with it rather than the whole job.
+
+**One allocation of 64, divided 16 × 4.** Right when the workers must share a
+node — MPI ranks, or a pool whose parts talk to each other:
+
+```bash
+qmap --tasks 16 --cores 4 --nodes 1 --inputs 'data/*.pdb' -- srun analyse {input}
+```
+
+```
+#SBATCH -N 1        #BSUB -n 64
+#SBATCH -n 16       #BSUB -R "span[hosts=1]"
+#SBATCH -c 4
+```
+
+qmap still runs your command once per array element, so `--tasks` only means
+anything if the command itself starts the workers — `srun`, `mpirun`, a
+`multiprocessing.Pool`, `xargs -P`. Without one of those, 15 of the 16 sit
+idle. The simpler version of this is `--cores 64` with a payload that spawns
+its own 16 workers.
+
 ### Partition vs QOS
 
 `--queue` is the partition (Slurm `-p`, LSF `-q`). Slurm's `-q` is a separate
@@ -319,6 +354,7 @@ the four rows marked *always*.
 | `--qos Q` | `#qos=` | `-q Q` | — (refused; use `--directive`) |
 | `--nodes N` | `#nodes=` | `-N N` | — (implied by `span[hosts=1]`) |
 | `--cores N` | `#core=`, `#cores=` | `-n 1` + `-c N` | `-n N`, plus `-R "span[hosts=1]"` when N > 1 |
+| `--tasks N` | `#tasks=` | `-n N` | `-n N×cores` (LSF counts slots) |
 | `--cores-per-gpu N` | `#cores_per_gpu=` | derives `--cores` from `--gpu`, nothing of its own | same |
 | `--gpu N` | `#gpu=` | `--gres=gpu:N` | `-gpu "num=N:mode=exclusive_process"` |
 | `--mem SPEC` | `#mem=` | `--mem=SPEC` | `-R "rusage[mem=SPEC]"` |

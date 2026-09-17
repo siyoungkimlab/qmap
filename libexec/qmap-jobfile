@@ -53,6 +53,7 @@ DIRECTIVES = {
     "time": "--walltime", "walltime": "--walltime",
     "core": "--cores", "cores": "--cores", "cpu": "--cores", "cpus": "--cores",
     "cores_per_gpu": "--cores-per-gpu",
+    "task": "--tasks", "tasks": "--tasks", "ntasks": "--tasks",
     "gpu": "--gpu", "gpus": "--gpu",
     "node": "--nodes", "nodes": "--nodes",
     "queue": "--queue", "partition": "--queue",

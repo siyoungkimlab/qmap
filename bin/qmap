@@ -60,7 +60,8 @@ usage: qmap [options] -- COMMAND [ARGS...]
                                          other scheduler ('-' reads stdin)
        qmap register NAME [--note TEXT] [options]   save these under NAME
        qmap templates                   list registered templates
-       qmap show NAME                   print one template
+       qmap show NAME                   one template: its note, options and
+                                        the directives it produces
        qmap forget NAME                 delete one template
 
 Nothing is submitted for you by default: every account, queue, walltime and
@@ -292,8 +293,9 @@ case ${1:-} in
                 [ -f "$f" ] || continue
                 found=1
                 n=$(basename "$f" .args)
-                printf '%-20s %s\n' "$n" "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^$' | tr '\n' ' ')"
-                sed -n 's/^# note: /  note: /p;s/^#       /        /p' "$f"
+                printf '%s\n' "$n"
+                printf '    %s\n' "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^$' | tr '\n' ' ')"
+                sed -n 's/^# note: /    /p;s/^#       /    /p' "$f"
             done
         done
         [ "$found" -eq 1 ] || printf 'no templates yet; register one with: %s register NAME [options]\n' "$PROG"
@@ -301,7 +303,28 @@ case ${1:-} in
     show)
         [ $# -ge 2 ] || die "show needs a name"
         f=$(tpl_file "$2") || die "no template '$2'"
-        printf '# %s\n' "$f"; cat "$f"; exit 0 ;;
+        printf '%s\n  %s\n\n' "$2" "$f"
+        sed -n 's/^# note: /  /p; s/^#       /  /p' "$f"
+        grep -q '^# note: ' "$f" && printf '\n'
+        printf '  options\n'
+        # The file is flag-then-value, except for the few flags that take none.
+        VALUELESS=" --stdin --no-module --no-modules --dry-run "
+        pending=
+        while IFS= read -r line || [ -n "$line" ]; do
+            case $line in '' | \#*) continue ;; esac
+            if [ -n "$pending" ]; then
+                printf '    %s %s\n' "$pending" "$line"; pending=
+            else
+                case $VALUELESS in
+                    *" $line "*) printf '    %s\n' "$line" ;;
+                    *) pending=$line ;;
+                esac
+            fi
+        done < "$f"
+        [ -z "$pending" ] || printf '    %s\n' "$pending"
+        printf '\n  directives\n'
+        "$SELF" directives "$2" 2>/dev/null | grep -v '^# job name' | sed 's/^/    /'
+        exit 0 ;;
     forget)
         [ $# -ge 2 ] || die "forget needs a name"
         check_name "$2"

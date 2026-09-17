@@ -22,12 +22,12 @@ or through a template you registered. There is no implicit cluster default.
 
 ```bash
 git clone https://github.com/siyoungkimlab/qmap.git ~/qmap
-export PATH="$HOME/qmap/bin:$PATH"        # in ~/.bashrc or ~/.zshrc
+ln -s ~/qmap/bin/qmap ~/.local/bin/qmap     # or any directory already on PATH
 ```
 
-Then `git pull` to update. A symlink works too, if you would rather not touch
-PATH — `ln -s ~/qmap/bin/qmap ~/.local/bin/qmap` — since qmap follows symlinks
-to find its own files.
+No shell configuration to edit, and `git pull` in `~/qmap` updates it — the
+link keeps pointing at the new copy. qmap follows symlinks to find its own
+files, so the link can live anywhere.
 
 ```
 bin/qmap              the scheduler side, and the only thing on PATH
@@ -100,6 +100,97 @@ header, so `qmap job.py --dry-run --account other` works.
 
 The job name defaults to the file's stem, and anything the Python raises stops
 everything before a single task is submitted.
+
+## Templates
+
+A template is a set of submission options saved under a name — an account, a
+queue, a core count, a walltime — so that a submission names a cluster setup
+instead of respelling it.
+
+**Which ones do I have?**
+
+```bash
+qmap templates
+```
+
+Each is listed with its options and its note:
+
+```
+Gautschi_H100_1GPU_4h
+    --scheduler slurm --account siyoungk --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h
+    Each Gautschi-H node has 8 x H100 GPUs and 112 CPU cores, so one GPU's share is 14.
+```
+
+**What exactly does one do?**
+
+```bash
+qmap show Gautschi_H100_1GPU_4h
+```
+
+which prints the note, the options, and the directives they turn into:
+
+```
+  options
+    --account siyoungk
+    --queue ai
+    --cores 14
+    --walltime 4h
+
+  directives
+    #SBATCH -A siyoungk
+    #SBATCH -p ai
+    #SBATCH -c 14
+    #SBATCH -t 4:00:00
+```
+
+`qmap directives NAME` prints that block on its own, ready to paste into a
+hand-written script, and `qmap directives NAME lsf` prints the other
+scheduler's.
+
+**Registering one.** Either spell out the options:
+
+```bash
+qmap register Gautschi_H100_1GPU_4h --scheduler slurm --account my-account \
+    --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h \
+    --note 'A node is 8 x H100 with 112 cores, so one GPU is 14 of them.'
+
+qmap forget Gautschi_H100_1GPU_4h     # delete one
+```
+
+or read them out of a script you already have — see *Converting an existing
+script* below.
+
+A template's options are spliced in where `--template` appears, exactly as if
+you had typed them there, so **anything after it wins**:
+
+```bash
+qmap --template Gautschi_H100_1GPU_4h --account other --cores 8 ...
+```
+
+Repeatable options (`--module`, `--directive`, `--setup`, `--export`)
+accumulate; `--no-module` clears the modules a template would load. Templates
+may reference other templates, so a personal one can build on a cluster one:
+
+```bash
+qmap register Gautschi_H100_1GPU_24h --template Gautschi_H100_1GPU_4h \
+    --walltime 24h --concurrency 64 --conda ommflow
+```
+
+Templates live in `~/.config/qmap/templates/*.args`, one argument per line, so
+a value may contain spaces without any escaping rules. Edit them by hand or
+re-register to replace. `qmap register` checks the option names, so a typo is
+caught then rather than at the next submission. None ships with qmap: a
+template applies only when you name it, and there are no implicit defaults to
+inherit.
+
+Name them for what you get rather than for the cluster alone — a walltime and
+a GPU count belong in the name, since one cluster has as many useful shapes as
+you have workloads:
+
+```
+Gautschi_H100_1GPU_4h
+Lilac_A100_1GPU_168h
+```
 
 ## One-liners: `qmap`
 
@@ -258,53 +349,6 @@ body or the run instead:
 | `--done-when 'TEST'` | — | skip inputs already finished |
 | `--scheduler S` | `#workload_manager=`, `#scheduler=` | `lsf`, `slurm`, or auto from `$PATH` |
 | `--dry-run` | — | print the script, submit nothing |
-
-## Templates
-
-A template is a set of submission options saved under a name. Register the ones
-you keep retyping:
-
-```bash
-qmap register Gautschi_H100_1GPU_4h --scheduler slurm --account my-account \
-    --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h \
-    --note 'A node is 8 x H100 with 112 cores, so one GPU is 14 of them.'
-
-qmap templates                        # list them, with their notes
-qmap show Gautschi_H100_1GPU_4h       # print one
-qmap forget Gautschi_H100_1GPU_4h     # delete one
-```
-
-A template's options are spliced in where `--template` appears, exactly as if
-you had typed them there, so **anything after it wins**:
-
-```bash
-qmap --template Gautschi_H100_1GPU_4h --account other --cores 8 ...
-```
-
-Repeatable options (`--module`, `--directive`, `--setup`, `--export`)
-accumulate; `--no-module` clears the modules a template would load. Templates
-may reference other templates, so a personal one can build on a cluster one:
-
-```bash
-qmap register Gautschi_H100_1GPU_24h --template Gautschi_H100_1GPU_4h \
-    --walltime 24h --concurrency 64 --conda ommflow
-```
-
-Templates live in `~/.config/qmap/templates/*.args`, one argument per line, so
-a value may contain spaces without any escaping rules. Edit them by hand or
-re-register to replace. `qmap register` checks the option names, so a typo is
-caught then rather than at the next submission. None ships with qmap: a
-template applies only when you name it, and there are no implicit defaults to
-inherit.
-
-Name them for what you get rather than for the cluster alone — a walltime and
-a GPU count belong in the name, since one cluster has as many useful shapes as
-you have workloads:
-
-```
-Gautschi_H100_1GPU_4h
-Lilac_A100_1GPU_168h
-```
 
 ## What a submission leaves behind
 

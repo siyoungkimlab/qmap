@@ -22,12 +22,12 @@ or through a template you registered. There is no implicit cluster default.
 
 ```bash
 git clone https://github.com/siyoungkimlab/qmap.git ~/qmap
-ln -s ~/qmap/bin/qmap ~/.local/bin/qmap     # or any directory already on PATH
+export PATH="$HOME/qmap/bin:$PATH"
 ```
 
-No shell configuration to edit, and `git pull` in `~/qmap` updates it — the
-link keeps pointing at the new copy. qmap follows symlinks to find its own
-files, so the link can live anywhere.
+`git pull` in `~/qmap` updates it. Symlinking works as well —
+`ln -s ~/qmap/bin/qmap ~/.local/bin/qmap` — since qmap follows symlinks to
+find its own files.
 
 ```
 bin/qmap              the scheduler side, and the only thing on PATH

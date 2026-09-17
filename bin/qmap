@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-VERSION=0.4.0
+VERSION=0.1.0
 PROG=${0##*/}
 # Follow symlinks: qmap is meant to be linked into a bin directory, and the
 # helper scripts sit beside the real file, not beside the link.

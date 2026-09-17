@@ -427,3 +427,7 @@ For `foo/bar/x.prepped.mae`:
 | `${VAR}` | passed through, resolved in the task's environment |
 
 Everything else: `qmap --help`.
+
+## License
+
+MIT.

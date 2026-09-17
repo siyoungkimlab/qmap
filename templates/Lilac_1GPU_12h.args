@@ -1,0 +1,14 @@
+# note: MSKCC Lilac, gpuqueue: one GPU on any available host, no card
+#       constraint, 8 slots, 12 hours. Queues sooner than asking for an A100,
+#       at the cost of landing on whatever card is free; use
+#       Lilac_A100_1GPU_4h when the run needs an A100 specifically.
+--scheduler
+lsf
+--queue
+gpuqueue
+--cores
+8
+--gpu
+1
+--walltime
+12h

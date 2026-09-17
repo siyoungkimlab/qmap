@@ -87,8 +87,8 @@ Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 
 ```python
 #Gautschi_H100_1GPU_4h
+#account=my-allocation
 #time=2:00:00
-#gpu=1
 ```
 
 An empty value (`#account=`) is a blank left to fill in and is ignored. A
@@ -114,9 +114,12 @@ qmap templates
 Each is listed with its options and its note:
 
 ```
-Gautschi_H100_1GPU_4h
-    --scheduler slurm --account siyoungk --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h
-    Each Gautschi-H node has 8 x H100 GPUs and 112 CPU cores, so one GPU's share is 14.
+Gautschi_H100_1GPU_4h   (shipped)
+    --scheduler slurm --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h
+    Purdue Gautschi, ai partition, one H100. A Gautschi-H node holds
+    8 x H100, 2 x Intel Xeon Platinum 8480+ and 112 CPU cores, so one
+    GPU's share is 14 cores. Pass --account for your own allocation.
+    needs: --account
 ```
 
 **What exactly does one do?**
@@ -129,16 +132,24 @@ which prints the note, the options, and the directives they turn into:
 
 ```
   options
-    --account siyoungk
+    --scheduler slurm
     --queue ai
+    --nodes 1
     --cores 14
+    --gpu 1
     --walltime 4h
 
   directives
-    #SBATCH -A siyoungk
+    #SBATCH -J Gautschi_H100_1GPU_4h
     #SBATCH -p ai
+    #SBATCH -N 1
+    #SBATCH -n 1
     #SBATCH -c 14
+    #SBATCH --gres=gpu:1
     #SBATCH -t 4:00:00
+    #SBATCH -o logs_Gautschi_H100_1GPU_4h/%A_%a.out
+    #SBATCH -e logs_Gautschi_H100_1GPU_4h/%A_%a.err
+    #SBATCH --array=1-N
 ```
 
 `qmap directives NAME` prints that block on its own, ready to paste into a
@@ -227,7 +238,7 @@ qmap --inputs 'raw/*.dcd' -- gzip -9 {input}
 **A real MD run on Gautschi**, 10 ns per prepared structure, 64 tasks at a time:
 
 ```bash
-qmap --template Gautschi_H100_1GPU_4h \
+qmap --template Gautschi_H100_1GPU_4h --account my-allocation \
      --inputs 'boltz_results_*/predictions/*/*.prepped.mae' \
      --name md --concurrency 64 \
      --conda ommflow --logdir logs_md \
@@ -246,7 +257,8 @@ qmap --template Lilac_A100_1GPU_4h ...
 exists exit immediately:
 
 ```bash
-qmap --template Gautschi_H100_1GPU_4h --inputs 'preds/*/*.mae' \
+qmap --template Gautschi_H100_1GPU_4h --account my-allocation \
+     --inputs 'preds/*/*.mae' \
      --done-when '[ -f {input.parent}/md_{input.stem}/DONE ]' \
      -- boonza md '{input}' --workdir '{input.parent}/md_{input.stem}'
 ```
@@ -358,7 +370,7 @@ its own 16 workers.
 thing, the QOS, and has its own flag:
 
 ```bash
-qmap --template Gautschi_H100_1GPU_4h --qos normal ...
+qmap --template Gautschi_H100_1GPU_4h --account my-allocation --qos normal ...
 ```
 
 There are deliberately no single-letter aliases: `-q`, `-p`, `-c`, `-n` and `-A`

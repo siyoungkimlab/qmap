@@ -917,15 +917,22 @@ build_header
     printf 'hostname\n'
     [ "$GPUS" -gt 0 ] && printf 'nvidia-smi -L || true\n'
     printf '\n'
-    if [ "$NMOD" -gt 0 ]; then
-        for m in "${MODULES[@]}"; do printf 'module load %s\n' "$m"; done
-        printf '\n'
-    fi
-    if [ -n "$CONDA_ENV" ]; then
-        printf '# conda activate is a shell function, and does not exist in a batch shell\n'
-        printf '# until this profile script is sourced.\n'
-        printf 'source "$(conda info --base)/etc/profile.d/conda.sh"\n'
-        printf 'conda activate %s\n\n' "$(sq "$CONDA_ENV")"
+    if [ "$NMOD" -gt 0 ] || [ -n "$CONDA_ENV" ]; then
+        printf '# Environment modules and conda are shell functions whose own scripts\n'
+        printf '# are not written to survive set -u: activating an env that carries, say,\n'
+        printf "# gxx_linux-64 reads CONDA_BACKUP_GXX unguarded and the job dies before it\n"
+        printf '# starts. They run with it off, and the task itself runs with it back on.\n'
+        printf 'set +u\n'
+        if [ "$NMOD" -gt 0 ]; then
+            for m in "${MODULES[@]}"; do printf 'module load %s\n' "$m"; done
+        fi
+        if [ -n "$CONDA_ENV" ]; then
+            printf '# conda activate is a shell function, and does not exist in a batch shell\n'
+            printf '# until this profile script is sourced.\n'
+            printf 'source "$(conda info --base)/etc/profile.d/conda.sh"\n'
+            printf 'conda activate %s\n' "$(sq "$CONDA_ENV")"
+        fi
+        printf 'set -u\n\n'
     fi
     printf '# Python block-buffers stdout when it is not a terminal, so without this the\n'
     printf '# log stays empty for hours and then arrives all at once.\n'

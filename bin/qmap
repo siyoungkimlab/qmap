@@ -559,6 +559,9 @@ if [ -z "$CORES" ] && [ -n "$CORES_PER_GPU" ] && [ "${GPUS:-0}" != 0 ]; then
     esac
     CORES=$((GPUS * CORES_PER_GPU))
 fi
+# %0 would be passed through to a scheduler that rejects it, and "none at a
+# time" means nothing: no limit is spelled by leaving the option out.
+[ "${CONCURRENCY:-1}" = 0 ] && die "--concurrency must be at least 1; omit it for no limit"
 for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "tasks:$TASKS" "concurrency:$CONCURRENCY"; do
     v=${pair#*:}
     [ -n "$v" ] || continue

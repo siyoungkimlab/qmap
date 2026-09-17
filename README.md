@@ -282,13 +282,21 @@ qmap register long-md --template gautschi-h100 --walltime 24:00:00 \
     --concurrency 64 --conda ommflow
 ```
 
-Yours live in `~/.config/qmap/templates/*.args`, one argument per line, so a
-value may contain spaces without any escaping rules. Edit them by hand or
+Templates live in `~/.config/qmap/templates/*.args`, one argument per line, so
+a value may contain spaces without any escaping rules. Edit them by hand or
 re-register to replace. `qmap register` checks the option names, so a typo is
-caught then rather than at the next submission. The three shipped in
-`templates/` here — `gautschi-h100`, `gautschi-a100`, `lilac-gpu` — are
-examples; none of them is applied unless you name it. Deliberately, none sets
-a walltime: that is a per-job decision.
+caught then rather than at the next submission. None ships with qmap: a
+template applies only when you name it, and there are no implicit defaults to
+inherit.
+
+Name them for what you get rather than for the cluster alone — a walltime and
+a GPU count belong in the name, since one cluster has as many useful shapes as
+you have workloads:
+
+```
+Gautschi_H100_1GPU_4h
+Lilac_A100_1GPU_168h
+```
 
 ## What a submission leaves behind
 

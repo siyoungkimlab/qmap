@@ -25,16 +25,6 @@ git clone https://github.com/siyoungkimlab/qmap.git ~/qmap
 export PATH="$HOME/qmap/bin:$PATH"
 ```
 
-`git pull` in `~/qmap` updates it. Symlinking works as well —
-`ln -s ~/qmap/bin/qmap ~/.local/bin/qmap` — since qmap follows symlinks to
-find its own files.
-
-```
-bin/qmap              the scheduler side, and the only thing on PATH
-libexec/qmap-jobfile  runs a Python job file
-libexec/qmap-directives   reads an existing #SBATCH/#BSUB block
-```
-
 No dependencies: bash 3.2 and any Python 3, so the same clone runs on a Mac
 and on a login node. Job files need Python; the flag form does not.
 
@@ -79,8 +69,6 @@ tasks. Nothing of it reaches the compute node.
   shell-quoted, so a path with a space survives. A name that is not a Python
   variable is left alone — `${TMPDIR}` and `${SLURM_JOB_ID}` resolve on the
   compute node as usual.
-- **A trailing backslash continues the command**, as in a shell, which is how a
-  long command line stays readable:
 
   ```python
   for mae in structures:
@@ -434,7 +422,9 @@ logs_<name>/      per-task stdout and stderr
 `job.sh` stands alone: it reads `SLURM_ARRAY_TASK_ID` or `LSB_JOBINDEX`,
 whichever is set, so when a job needs something no flag covers, edit that file
 and resubmit it by hand with `sbatch` or `bsub <`. `--dry-run` prints it
-without submitting.
+without submitting, and writes it to `.qmap/dry-run/`, one directory reused
+by every preview, so previewing leaves no trail of stamped directories or log
+directories behind.
 
 Each submission gets its own directory on purpose. A running array reads its
 list lazily, one task at a time, so a single shared list file would let a

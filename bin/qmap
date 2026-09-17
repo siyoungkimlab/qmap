@@ -867,9 +867,19 @@ if [ -n "$DONE_WHEN" ]; then
 fi
 
 # ------------------------------------------------------------- artifact dir
-STAMP=$(date +%Y%m%d-%H%M%S)
-RUNDIR=.qmap/$NAME-$STAMP
-mkdir -p "$RUNDIR" "$LOGDIR"
+# A dry run reuses one directory and creates no log directory: it is a
+# preview, and a preview that litters the tree is a nuisance. A real
+# submission gets its own stamped directory, and the logs one has to exist
+# before the scheduler writes into it.
+if [ "$DRYRUN" -eq 1 ]; then
+    RUNDIR=.qmap/dry-run
+    rm -rf "$RUNDIR"
+    mkdir -p "$RUNDIR"
+else
+    STAMP=$(date +%Y%m%d-%H%M%S)
+    RUNDIR=.qmap/$NAME-$STAMP
+    mkdir -p "$RUNDIR" "$LOGDIR"
+fi
 # A fresh list per submission on purpose: the running array reads its own list
 # lazily, so overwriting one shared file would rewrite a live job's inputs.
 LIST=$(cd "$RUNDIR" && pwd)/inputs.txt

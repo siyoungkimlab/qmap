@@ -80,7 +80,7 @@ Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 `setup`, `name`, `logdir`, `template`. A bare `#name` is a registered template:
 
 ```python
-#gautschi-h100
+#Gautschi_H100_1GPU_4h
 #time=2:00:00
 #gpu=1
 ```
@@ -104,9 +104,9 @@ qmap --inputs 'raw/*.dcd' -- gzip -9 {input}
 **A real MD run on Gautschi**, 10 ns per prepared structure, 64 tasks at a time:
 
 ```bash
-qmap --template gautschi-h100 \
+qmap --template Gautschi_H100_1GPU_4h \
      --inputs 'boltz_results_*/predictions/*/*.prepped.mae' \
-     --name md --gpu 1 --walltime 2:00:00 --concurrency 64 \
+     --name md --concurrency 64 \
      --conda ommflow --logdir logs_md \
      -- boonza md '{input}' \
         --workdir '{input.parent}/md_{input.stem}' \
@@ -116,14 +116,14 @@ qmap --template gautschi-h100 \
 **The same work on Lilac** — one word changes:
 
 ```bash
-qmap --template lilac-gpu ... --walltime 24:00 ...
+qmap --template Lilac_A100_1GPU_4h ...
 ```
 
 **Continue where it left off.** Resubmit the same command; tasks whose marker
 exists exit immediately:
 
 ```bash
-qmap --template gautschi-h100 --inputs 'preds/*/*.mae' --gpu 1 --walltime 2:00:00 \
+qmap --template Gautschi_H100_1GPU_4h --inputs 'preds/*/*.mae' \
      --done-when '[ -f {input.parent}/md_{input.stem}/DONE ]' \
      -- boonza md '{input}' --workdir '{input.parent}/md_{input.stem}'
 ```
@@ -257,20 +257,20 @@ A template is a set of submission options saved under a name. Register the ones
 you keep retyping:
 
 ```bash
-qmap register gautschi-h100 --scheduler slurm --account siyoungk --queue ai \
-    --cores-per-gpu 14 --directive '-q normal' \
-    --module conda/2026.03 --module cuda/12.6.0
+qmap register Gautschi_H100_1GPU_4h --scheduler slurm --account my-account \
+    --queue ai --nodes 1 --cores 14 --gpu 1 --walltime 4h \
+    --note 'A node is 8 x H100 with 112 cores, so one GPU is 14 of them.'
 
-qmap templates            # list them
-qmap show gautschi-h100   # print one
-qmap forget gautschi-h100 # delete one
+qmap templates                        # list them, with their notes
+qmap show Gautschi_H100_1GPU_4h       # print one
+qmap forget Gautschi_H100_1GPU_4h     # delete one
 ```
 
 A template's options are spliced in where `--template` appears, exactly as if
 you had typed them there, so **anything after it wins**:
 
 ```bash
-qmap --template gautschi-h100 --account other --cores 8 ...
+qmap --template Gautschi_H100_1GPU_4h --account other --cores 8 ...
 ```
 
 Repeatable options (`--module`, `--directive`, `--setup`, `--export`)
@@ -278,8 +278,8 @@ accumulate; `--no-module` clears the modules a template would load. Templates
 may reference other templates, so a personal one can build on a cluster one:
 
 ```bash
-qmap register long-md --template gautschi-h100 --walltime 24:00:00 \
-    --concurrency 64 --conda ommflow
+qmap register Gautschi_H100_1GPU_24h --template Gautschi_H100_1GPU_4h \
+    --walltime 24h --concurrency 64 --conda ommflow
 ```
 
 Templates live in `~/.config/qmap/templates/*.args`, one argument per line, so

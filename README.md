@@ -70,16 +70,6 @@ tasks. Nothing of it reaches the compute node.
   variable is left alone — `${TMPDIR}` and `${SLURM_JOB_ID}` resolve on the
   compute node as usual.
 
-  ```python
-  for mae in structures:
-      ! boonza md ${mae} --workdir md/${mae} \
-            --equilibration-ns 0.5 --production-ns 2 \
-            --platform CUDA --early-stop
-  ```
-
-- `task('...')` and `sh('...')` are available when you would rather be explicit
-  than rely on where the `!` sits.
-
 Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 `time`/`walltime`, `core`/`cores`, `cores_per_gpu`, `gpu`, `nodes`, `queue`/`partition`,
 `mem`, `qos`, `constraint`, `concurrency`, `conda`, `module`, `directive`, `export`,
@@ -87,7 +77,7 @@ Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 
 ```python
 #Gautschi_H100_1GPU_4h
-#account=my-allocation
+#account=siyoungk
 #time=2:00:00
 ```
 

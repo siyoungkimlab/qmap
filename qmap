@@ -29,7 +29,15 @@ set -euo pipefail
 
 VERSION=0.4.0
 PROG=${0##*/}
-SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Follow symlinks: qmap is meant to be linked into a bin directory, and the
+# helper scripts sit beside the real file, not beside the link.
+SELF=${BASH_SOURCE[0]}
+while [ -L "$SELF" ]; do
+    SELF_LINK_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+    SELF=$(readlink "$SELF")
+    case $SELF in /*) ;; *) SELF=$SELF_LINK_DIR/$SELF ;; esac
+done
+SELF_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
 USER_TPL_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/qmap/templates
 TPL_DIRS="$USER_TPL_DIR $SELF_DIR/templates"
 
@@ -243,12 +251,21 @@ case ${1:-} in
         for a in "$@"; do
             [ "$a" = "--" ] && die "a template holds submission options only, not a command"
         done
-        # Catch a typo now rather than at the next submission.
+        # Catch a typo now rather than at the next submission. A flag's value
+        # is skipped, since --directive '-n 64' legitimately starts with a dash.
+        VALUELESS=" --stdin --no-module --no-modules --dry-run "
+        expect_value=0
         for a in "$@"; do
+            if [ "$expect_value" -eq 1 ]; then expect_value=0; continue; fi
             case $a in
-                -*) case " $(printf '%s' "$KNOWN_FLAGS" | tr '\n' ' ') " in
+                -*)
+                    case " $(printf '%s' "$KNOWN_FLAGS" | tr '\n' ' ') " in
                         *" ${a%%=*} "*) ;;
                         *) die "unknown option '$a'; see --help" ;;
+                    esac
+                    case $a in
+                        *=*) ;;
+                        *) case $VALUELESS in *" $a "*) ;; *) expect_value=1 ;; esac ;;
                     esac ;;
             esac
         done

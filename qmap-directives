@@ -100,7 +100,7 @@ def tokenize(text):
 
     for raw in lines:
         line = raw.strip()
-        m = re.match(r"^(?:\S*=\S*\s+)*(sbatch|bsub)\b(.*)$", line)
+        m = re.match(r"^(?:\S*=\S*\s+)*(sbatch|salloc|srun|sinteractive|bsub)\b(.*)$", line)
         if not m:
             continue
         body = m.group(2)
@@ -109,8 +109,12 @@ def tokenize(text):
             tokens = shlex.split(body, comments=True)
         except ValueError as exc:
             die(f"cannot read command line: {line} ({exc})")
-        if tokens and not tokens[-1].startswith("-"):
-            tokens = tokens[:-1]                  # the script being submitted
+        # The script being submitted trails the flags — but so does the value
+        # of the last flag, so only something path-shaped is dropped.
+        if tokens and not tokens[-1].startswith("-") and (
+                "/" in tokens[-1]
+                or re.search(r"\.(sh|sub|py|bash|slurm|lsf|job)$", tokens[-1])):
+            tokens = tokens[:-1]
         kind = "bsub" if m.group(1) == "bsub" else "sbatch"
         note(f"read the {m.group(1)} command line rather than #{kind.upper()} lines")
         return [(kind, tokens)]
@@ -154,7 +158,24 @@ def keep(out, flag, value, shown):
     out[flag] = value
 
 
+ATTACHED_SLURM = re.compile(r"^-([ANncptqCJ])(.+)$")
+ATTACHED_LSF = re.compile(r"^-([nqWPJ])(\d.*)$")
+
+
+def split_attached(tokens, pattern):
+    """-n64 and -n 64 mean the same thing; make them look the same."""
+    out = []
+    for t in tokens:
+        m = pattern.match(t)
+        if m:
+            out += [f"-{m.group(1)}", m.group(2)]
+        else:
+            out.append(t)
+    return out
+
+
 def parse_lsf(tokens, out, extra):
+    tokens = split_attached(tokens, ATTACHED_LSF)
     it = iter(range(len(tokens)))
     i = 0
     while i < len(tokens):
@@ -167,7 +188,9 @@ def parse_lsf(tokens, out, extra):
         elif t == "-n":
             keep(out, "--cores", nxt, "-n"); i += 2
         elif t == "-W":
-            if has_shell(nxt):
+            if nxt is None:
+                note("left out -W: no value")
+            elif has_shell(nxt):
                 note(f"left out -W {nxt}: a shell variable, not a duration")
             else:
                 out["--walltime"] = minutes_to_units(lsf_walltime(nxt))
@@ -210,6 +233,7 @@ def parse_lsf(tokens, out, extra):
 
 
 def parse_slurm(tokens, out, extra):
+    tokens = split_attached(tokens, ATTACHED_SLURM)
     i = 0
     while i < len(tokens):
         t = tokens[i]
@@ -233,7 +257,9 @@ def parse_slurm(tokens, out, extra):
         elif t in ("-c", "--cpus-per-task"):
             keep(out, "--cores", value, t)
         elif t in ("-t", "--time"):
-            if has_shell(value):
+            if value is None:
+                note(f"left out {t}: no value")
+            elif has_shell(value):
                 note(f"left out {t} {value}: a shell variable, not a duration")
             else:
                 out["--walltime"] = minutes_to_units(slurm_walltime(value))

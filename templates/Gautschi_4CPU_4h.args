@@ -1,0 +1,14 @@
+# note: Purdue Gautschi, cpu partition: one task of 4 cores. One array element
+#       per input; --concurrency N caps how many run at once, so 16 of these
+#       is 64 cores in flight. Pass --account for your own allocation.
+# require: --account
+--scheduler
+slurm
+--queue
+cpu
+--nodes
+1
+--cores
+4
+--walltime
+4h

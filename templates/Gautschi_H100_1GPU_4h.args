@@ -1,0 +1,16 @@
+# note: Purdue Gautschi, ai partition, one H100. A Gautschi-H node holds
+#       8 x H100, 2 x Intel Xeon Platinum 8480+ and 112 CPU cores, so one
+#       GPU's share is 14 cores. Pass --account for your own allocation.
+# require: --account
+--scheduler
+slurm
+--queue
+ai
+--nodes
+1
+--cores
+14
+--gpu
+1
+--walltime
+4h

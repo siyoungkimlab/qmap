@@ -1,0 +1,14 @@
+# note: MSKCC Lilac, gpuqueue, one A100 with 12 slots, a week of walltime. LSF takes no account
+#       here; -L /bin/bash and span[hosts=1] are added by qmap.
+--scheduler
+lsf
+--queue
+gpuqueue
+--cores
+12
+--constraint
+A100
+--gpu
+1
+--walltime
+168h

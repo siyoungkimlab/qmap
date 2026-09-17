@@ -186,12 +186,38 @@ qmap register Gautschi_H100_1GPU_24h --template Gautschi_H100_1GPU_4h \
     --walltime 24h --concurrency 64 --conda ommflow
 ```
 
-Templates live in `~/.config/qmap/templates/*.args`, one argument per line, so
-a value may contain spaces without any escaping rules. Edit them by hand or
-re-register to replace. `qmap register` checks the option names, so a typo is
-caught then rather than at the next submission. None ships with qmap: a
-template applies only when you name it, and there are no implicit defaults to
-inherit.
+**What ships with qmap.** Four templates describing clusters this was written
+against — `Gautschi_H100_1GPU_4h`, `Gautschi_4CPU_4h`, `Lilac_A100_1GPU_4h`,
+`Lilac_A100_1GPU_168h`. They carry the hardware and queue, never an account,
+because that part is yours. A template can say so:
+
+```
+# require: --account
+```
+
+and qmap then refuses to submit without it, naming what is missing, rather
+than letting the scheduler reject the job a moment later:
+
+```
+$ qmap --template Gautschi_4CPU_4h --inputs 'data/*.pdb' -- analyse {input}
+qmap: template Gautschi_4CPU_4h needs --account, which it cannot know for you.
+```
+
+Pass `--account` each time, or register your own copy that carries it —
+`qmap register` writes to `~/.config/qmap/templates/`, which is searched first,
+so your version of a name replaces the shipped one:
+
+```bash
+qmap register Gautschi_4CPU_4h --from - --require account <<'EOF'
+#SBATCH -A my-allocation -p cpu -N 1 -c 4 -t 4:00:00
+EOF
+```
+
+Templates are `*.args` files, one argument per line, so a value may contain
+spaces without any escaping rules. Edit them by hand or re-register to
+replace. `qmap register` checks the option names, so a typo is caught then
+rather than at the next submission. Nothing is applied unless you name it:
+there are no implicit defaults to inherit.
 
 Name them for what you get rather than for the cluster alone — a walltime and
 a GPU count belong in the name, since one cluster has as many useful shapes as

@@ -58,7 +58,8 @@ usage: qmap [options] -- COMMAND [ARGS...]
        qmap directives NAME [lsf|slurm]  print a template's #SBATCH/#BSUB block
        qmap convert FILE [lsf|slurm]     convert a script's directives to the
                                          other scheduler ('-' reads stdin)
-       qmap register NAME [--note TEXT] [options]   save these under NAME
+       qmap register NAME [--note TEXT] [--require OPT] [options]
+                                        save these options under NAME
        qmap templates                   list registered templates
        qmap show NAME                   one template: its note, options and
                                         the directives it produces
@@ -187,15 +188,39 @@ check_name() {
 # A template is the option list itself, one argument per line, so a value may
 # hold spaces or quotes without any escaping rules of its own.
 TPL_ARGS=()
+REQUIRED=
 tpl_load() {
     local f line
     check_name "$1"
     f=$(tpl_file "$1") || die "no template '$1'; 'qmap templates' lists them"
     TPL_ARGS=(); local k=0
     while IFS= read -r line || [ -n "$line" ]; do
-        case $line in '' | \#*) continue ;; esac
-        TPL_ARGS[k]=$line; k=$((k+1))
+        case $line in
+            '#require:'* | '# require:'*)
+                # What the template cannot know: an account, usually.
+                REQUIRED="$REQUIRED ${line#*:} " ;;
+            '' | \#*) continue ;;
+            *) TPL_ARGS[k]=$line; k=$((k+1)) ;;
+        esac
     done < "$f"
+}
+
+# The option that would carry a required value, by name.
+value_of_flag() {
+    case $1 in
+        --account) printf '%s' "$ACCOUNT" ;;
+        --queue) printf '%s' "$QUEUE" ;;
+        --qos) printf '%s' "$QOS" ;;
+        --walltime) printf '%s' "$WALLTIME" ;;
+        --cores) printf '%s' "$CORES" ;;
+        --tasks) printf '%s' "$TASKS" ;;
+        --nodes) printf '%s' "$NODES" ;;
+        --mem) printf '%s' "$MEM" ;;
+        --constraint) printf '%s' "$CONSTRAINT" ;;
+        --conda) printf '%s' "$CONDA_ENV" ;;
+        --gpu) [ "${GPUS:-0}" = 0 ] || printf '%s' "$GPUS" ;;
+        *) printf 'unknown' ;;
+    esac
 }
 
 # --------------------------------------------------------------- job files
@@ -231,7 +256,7 @@ case ${1:-} in
         name=$1; shift
         check_name "$name"
         # --note is a comment kept with the template, not an option to replay.
-        NOTE=; FROM=
+        NOTE=; FROM=; REQ=
         RARGS=(); NR=0
         while [ $# -gt 0 ]; do
             case $1 in
@@ -239,6 +264,8 @@ case ${1:-} in
                 --note=*) NOTE=${1#*=}; shift ;;
                 --from) [ $# -ge 2 ] || die "--from needs a file ('-' for stdin)"; FROM=$2; shift 2 ;;
                 --from=*) FROM=${1#*=}; shift ;;
+                --require) [ $# -ge 2 ] || die "--require needs an option name"; REQ="$REQ ${2#--}"; shift 2 ;;
+                --require=*) REQ="$REQ ${1#*=}"; shift ;;
                 *) RARGS[NR]=$1; NR=$((NR+1)); shift ;;
             esac
         done
@@ -284,21 +311,31 @@ case ${1:-} in
         f=$USER_TPL_DIR/$name.args
         { printf '# qmap template %s, registered %s\n' "$name" "$(date)"
           [ -n "$NOTE" ] && printf '%s\n' "$NOTE" | sed -e '1s/^/# note: /' -e '2,$s/^/#       /'
+          for r in $REQ; do printf '# require: --%s\n' "${r#--}"; done
           printf '# One argument per line. Edit freely, or re-register to replace.\n'
           printf '%s\n' "$@"; } > "$f"
         printf 'registered %s -> %s\n' "$name" "$f"
         exit 0 ;;
     templates)
         found=0
+        # Your own directory is searched first, so a template you register
+        # under a shipped name replaces it; list it once, the one that wins.
+        SEEN=" "
         for d in $TPL_DIRS; do
             [ -d "$d" ] || continue
             for f in "$d"/*.args; do
                 [ -f "$f" ] || continue
-                found=1
                 n=$(basename "$f" .args)
+                case $SEEN in *" $n "*) continue ;; esac
+                SEEN="$SEEN$n "
+                found=1
+                case $d in
+                    "$USER_TPL_DIR") ;;
+                    *) n="$n   (shipped)" ;;
+                esac
                 printf '%s\n' "$n"
                 printf '    %s\n' "$(grep -v '^[[:space:]]*#' "$f" | grep -v '^$' | tr '\n' ' ')"
-                sed -n 's/^# note: /    /p;s/^#       /    /p' "$f"
+                sed -n 's/^# note: /    /p;s/^#       /    /p;s/^# require: /    needs: /p' "$f"
             done
         done
         [ "$found" -eq 1 ] || printf 'no templates yet; register one with: %s register NAME [options]\n' "$PROG"
@@ -535,6 +572,17 @@ if [ -n "$SCHED_SRC" ] && [ "$SCHED_SRC" != "$SCHED" ] && [ -n "$WALLTIME" ] \
        LSF reads [hh]:mm while Slurm reads [d-]hh:mm:ss (to Slurm, '24:00' is 24 minutes).
        Check it before using this."
 fi
+
+for req in $REQUIRED; do
+    [ -n "$(value_of_flag "$req")" ] && continue
+    if [ "$MODE" = directives ]; then
+        warn "template${TPL_USED} needs $req; showing the rest without it"
+    else
+        die "template${TPL_USED} needs $req, which it cannot know for you.
+       Pass it here, or register your own template that carries it:
+           qmap --template${TPL_USED} $req <value> ..."
+    fi
+done
 
 TPL_NOTE=
 if [ -n "$TPL_USED" ]; then

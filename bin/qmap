@@ -38,8 +38,15 @@ while [ -L "$SELF" ]; do
     case $SELF in /*) ;; *) SELF=$SELF_LINK_DIR/$SELF ;; esac
 done
 SELF_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+# Helpers live in libexec so that putting bin/ on PATH exposes only qmap
+# itself; a flat directory holding all three still works.
+if [ -d "$SELF_DIR/../libexec" ]; then
+    LIBEXEC=$(cd -- "$SELF_DIR/../libexec" && pwd)
+else
+    LIBEXEC=$SELF_DIR
+fi
 USER_TPL_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/qmap/templates
-TPL_DIRS="$USER_TPL_DIR $SELF_DIR/templates"
+TPL_DIRS="$USER_TPL_DIR $LIBEXEC/../templates"
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
@@ -129,7 +136,7 @@ KNOWN_FLAGS="--inputs --list --input --stdin --name --gpu --gpus --cores -c
 --no-modules --export --setup --chdir --done-when --logdir
 --scheduler --template -T --dry-run"
 
-DIRECTIVE_READER=$SELF_DIR/qmap-directives
+DIRECTIVE_READER=$LIBEXEC/qmap-directives
 OPTS=(); NO=0
 read_directives() {   # FILE or '-' -> OPTS
     OPTS=(); NO=0
@@ -190,7 +197,7 @@ tpl_load() {
 # --------------------------------------------------------------- job files
 # `qmap job.py` runs a Python job file; the flag form always has a -- payload,
 # so the two never collide.
-JOBFILE_RUNNER=$SELF_DIR/qmap-jobfile
+JOBFILE_RUNNER=$LIBEXEC/qmap-jobfile
 has_payload=0
 for a in ${@+"$@"}; do
     [ "$a" = "--" ] && { has_payload=1; break; }
@@ -299,7 +306,7 @@ case ${1:-} in
         [ $# -ge 2 ] || die "forget needs a name"
         check_name "$2"
         f=$USER_TPL_DIR/$2.args
-        [ -f "$f" ] || die "no template '$2' in $USER_TPL_DIR (templates shipped in $SELF_DIR/templates are not removed this way)"
+        [ -f "$f" ] || die "no template '$2' in $USER_TPL_DIR (templates shipped with qmap are not removed this way)"
         rm -- "$f"; printf 'forgot %s\n' "$2"; exit 0 ;;
     convert)
         # Read one scheduler's directives, print the other's.

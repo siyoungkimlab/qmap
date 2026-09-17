@@ -21,14 +21,22 @@ or through a template you registered. There is no implicit cluster default.
 ## Install
 
 ```bash
-ln -s ~/qmap/qmap ~/bin/qmap          # anywhere on PATH
+git clone https://github.com/siyoungkimlab/qmap.git ~/qmap
+export PATH="$HOME/qmap/bin:$PATH"        # in ~/.bashrc or ~/.zshrc
 ```
 
-One bash script for the scheduler side, one Python script beside it
-(`qmap-jobfile`) for job files, no dependencies.
+Then `git pull` to update. A symlink works too, if you would rather not touch
+PATH — `ln -s ~/qmap/bin/qmap ~/.local/bin/qmap` — since qmap follows symlinks
+to find its own files.
 
-Compatible with bash 3.2 and any Python 3, so the same copy runs on a Mac and
-on a login node.
+```
+bin/qmap              the scheduler side, and the only thing on PATH
+libexec/qmap-jobfile  runs a Python job file
+libexec/qmap-directives   reads an existing #SBATCH/#BSUB block
+```
+
+No dependencies: bash 3.2 and any Python 3, so the same clone runs on a Mac
+and on a login node. Job files need Python; the flag form does not.
 
 ## Job files: `qmap job.py`
 

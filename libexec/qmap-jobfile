@@ -135,15 +135,33 @@ def parse_header(text):
 
 
 def transform(text, path):
-    """`!` lines become calls, then loops holding them get an iteration marker."""
-    out = []
-    for lineno, raw in enumerate(text.splitlines(), 1):
-        m = BANG.match(raw)
-        if m:
-            out.append(f"{m.group('indent')}_qmp.bang({m.group('cmd').strip()!r}, {lineno})")
-        else:
-            out.append(raw)
-    tree = ast.parse("\n".join(out), filename=str(path))
+    """`!` lines become calls, then loops holding them get an iteration marker.
+
+    A trailing backslash continues the command on the next line, as it would in
+    a shell. The continued lines are replaced with blanks rather than removed,
+    so every later line keeps the number it has in the file.
+    """
+    lines = text.splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        m = BANG.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+        cmd, eaten = m.group("cmd").strip(), 0
+        while cmd.endswith("\\") and i + eaten + 1 < len(lines):
+            eaten += 1
+            cmd = cmd[:-1].rstrip() + " " + lines[i + eaten].strip()
+        if cmd.endswith("\\"):
+            die(f"{path}:{i + 1}: the file ends with a continued ! command")
+        out.append(f"{m.group('indent')}_qmp.bang({cmd!r}, {i + 1})")
+        out += [""] * eaten
+        i += eaten + 1
+    try:
+        tree = ast.parse("\n".join(out), filename=str(path))
+    except SyntaxError as exc:
+        die(f"{path}:{exc.lineno}: {exc.msg}")
 
     def holds_bang(node):
         return any(

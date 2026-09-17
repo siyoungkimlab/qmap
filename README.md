@@ -79,6 +79,16 @@ tasks. Nothing of it reaches the compute node.
   shell-quoted, so a path with a space survives. A name that is not a Python
   variable is left alone — `${TMPDIR}` and `${SLURM_JOB_ID}` resolve on the
   compute node as usual.
+- **A trailing backslash continues the command**, as in a shell, which is how a
+  long command line stays readable:
+
+  ```python
+  for mae in structures:
+      ! boonza md ${mae} --workdir md/${mae} \
+            --equilibration-ns 0.5 --production-ns 2 \
+            --platform CUDA --early-stop
+  ```
+
 - `task('...')` and `sh('...')` are available when you would rather be explicit
   than rely on where the `!` sits.
 

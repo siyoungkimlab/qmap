@@ -14,6 +14,10 @@ differ between clusters. `qmap` writes those, templates your command line with
 Python's `str.format` syntax, and submits. It knows nothing about any
 particular program.
 
+`--scheduler local` drops the directives and runs the tasks on the machine
+you are sitting at, so the same command line works on a laptop and on a
+cluster.
+
 **Nothing is set for you.** An account, queue, walltime or core count appears
 in the generated script only because you asked for it — on the command line,
 or through a template you registered. There is no implicit cluster default.
@@ -415,8 +419,66 @@ body or the run instead:
 | `--chdir DIR` | — | the directory tasks run in (default: where you submit) |
 | `--inputs`, `--list`, `--input`, `--stdin` | — | what to map the command over |
 | `--done-when 'TEST'` | — | skip inputs already finished |
-| `--scheduler S` | `#workload_manager=`, `#scheduler=` | `lsf`, `slurm`, or auto from `$PATH` |
+| `--scheduler S` | `#workload_manager=`, `#scheduler=` | `lsf`, `slurm`, `local`, or auto from `$PATH` |
 | `--dry-run` | — | print the script, submit nothing |
+
+## Running locally: `--scheduler local`
+
+The same job, with no scheduler anywhere: `--scheduler local` runs the tasks
+here and now instead of writing directives for a cluster.
+
+```bash
+qmap --scheduler local --concurrency 4 \
+     --inputs 'raw/*.dcd' -- gzip -9 {input}
+```
+
+It is the same array, the same `job.sh` and the same `inputs.txt` — only the
+directive block is gone and qmap walks the task indices itself. That makes it
+the honest way to try a job on a handful of inputs before sending ten thousand
+of them to a queue: change one word and the command line stays put.
+
+**`--concurrency` is the parallelism, and it defaults to one.** Everywhere else
+an omitted `--concurrency` means "no cap", which locally would mean starting
+every task at once; here it means one at a time until you say otherwise.
+
+**Nothing is allocated.** A local run has no one to ask for an account, a
+queue, a walltime, a GPU or memory, so those are ignored and qmap says which
+ones it dropped. That includes the GPU: two tasks running at once share
+whichever one the machine has. Templates keep working — `--template
+Gautschi_H100_1GPU_4h --scheduler local` runs the same command line here and
+warns about the rest.
+
+**Each task gets its own pair of log files**, as it would under a scheduler,
+so parallel tasks do not interleave into one unreadable stream:
+
+```
+logs_<name>/local-<stamp>_<index>.out
+logs_<name>/local-<stamp>_<index>.err
+```
+
+Failures are counted rather than fatal: the run finishes the remaining tasks,
+lists the ones that came back non-zero, and exits non-zero itself.
+
+```
+  [1/3] ok
+  [2/3] FAILED (exit 1) logs_demo/local-20260919-173404_2.err
+  [3/3] ok
+qmap: 1 task(s) failed: 2
+qmap: rerun those with: .qmap/demo-20260919-173404/run.sh 2
+```
+
+That `run.sh` is an ordinary script kept beside `job.sh`. Run it again to
+repeat the whole array, or name task numbers to redo only those. To run one
+task in the foreground with its output on your terminal, skip the driver
+entirely:
+
+```bash
+QMAP_TASK_ID=2 .qmap/demo-20260919-173404/job.sh
+```
+
+`auto` never chooses `local`. Finding no `sbatch` and no `bsub` is the normal
+state of a laptop, and it should not quietly mean "run a thousand tasks here";
+ask for it by name.
 
 ## What a submission leaves behind
 
@@ -424,12 +486,15 @@ body or the run instead:
 .qmap/<name>-<timestamp>/
     job.sh        the generated script, exactly as submitted
     inputs.txt    the input list that script indexes into
+    run.sh        --scheduler local only: the driver that walks the tasks
+    failed        --scheduler local only: the tasks that came back non-zero
 logs_<name>/      per-task stdout and stderr
 ```
 
-`job.sh` stands alone: it reads `SLURM_ARRAY_TASK_ID` or `LSB_JOBINDEX`,
-whichever is set, so when a job needs something no flag covers, edit that file
-and resubmit it by hand with `sbatch` or `bsub <`. `--dry-run` prints it
+`job.sh` stands alone: it reads `QMAP_TASK_ID`, `SLURM_ARRAY_TASK_ID` or
+`LSB_JOBINDEX`, whichever is set, so when a job needs something no flag covers,
+edit that file and resubmit it by hand with `sbatch` or `bsub <` — or run one
+task right here with `QMAP_TASK_ID=7 .qmap/<name>-<stamp>/job.sh`. `--dry-run` prints it
 without submitting, and writes it to `.qmap/dry-run/`, one directory reused
 by every preview, so previewing leaves no trail of stamped directories or log
 directories behind.

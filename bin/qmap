@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# qmap — map one command over a list of inputs, as an LSF or Slurm job array.
+# qmap — map one command over a list of inputs, as an LSF or Slurm job array,
+# or with --scheduler local, as a plain parallel run on this machine.
 #
 # Every array job has the same three parts: a list of inputs, a command line to
 # run on each one, and a block of scheduler directives. Only the directives
@@ -115,7 +116,9 @@ Submission parameters (all optional; omitted from the script when not given)
   --qos Q              Slurm QOS (-q); LSF has none, use --directive
   --account A          LSF -P / Slurm -A
   --constraint C       LSF -R C / Slurm -C C   (e.g. A100)
-  --concurrency N      cap tasks running at once
+  --concurrency N      cap tasks running at once. Under --scheduler local
+                       this is the parallelism, and leaving it out means one
+                       at a time, not all at once
   --directive TEXT     raw extra directive, repeatable (e.g. --directive '-q normal')
 
 Environment on the compute node
@@ -129,7 +132,11 @@ Environment on the compute node
 Behaviour
   --done-when 'TEST'   shell test per task; if it succeeds, skip that input
   --logdir DIR         per-task stdout/stderr (default logs_<name>)
-  --scheduler S        lsf | slurm | auto (default auto, from what is on PATH)
+  --scheduler S        lsf | slurm | local | auto (default auto, from what is
+                       on PATH). local runs the tasks here and now, in this
+                       shell, rather than writing directives for a cluster;
+                       options only a scheduler can honour are ignored, with
+                       a warning naming them
   --dry-run, -n        print the generated script, submit nothing
   --version, --help
 USAGE
@@ -379,6 +386,7 @@ case ${1:-} in
         while [ $# -gt 0 ]; do
             case $1 in
                 lsf | slurm) TGT=$1 ;;
+                local) die "there is nothing to convert to: a local run has no directives" ;;
                 -) SRC=- ;;
                 *=*) CARGS[NCA]=$1; NCA=$((NCA+1)) ;;
                 -*)
@@ -415,6 +423,7 @@ case ${1:-} in
         while [ $# -gt 0 ]; do
             case $1 in
                 lsf | slurm) DARGS[ND]=--scheduler; DARGS[$((ND+1))]=$1; ND=$((ND+2)) ;;
+                local) die "a local run has no directives; $PROG directives takes lsf or slurm" ;;
                 *=*) DARGS[ND]=$1; ND=$((ND+1)) ;;
                 -*)
                     DARGS[ND]=$1; ND=$((ND+1))
@@ -518,9 +527,16 @@ case $SCHED in
     auto)
         if command -v sbatch >/dev/null 2>&1; then SCHED=slurm
         elif command -v bsub >/dev/null 2>&1; then SCHED=lsf
-        else die "neither sbatch nor bsub on PATH; pass --scheduler lsf|slurm (with --dry-run to just generate)"; fi ;;
+        # Not local: finding no scheduler is the normal state of a laptop, and
+        # quietly running a thousand tasks here is not what that should mean.
+        else die "neither sbatch nor bsub on PATH; pass --scheduler lsf|slurm to
+       generate for a cluster (--dry-run to only generate), or --scheduler local
+       to run the tasks here"; fi ;;
     lsf|slurm) ;;
-    *) die "--scheduler must be lsf, slurm or auto" ;;
+    local)
+        [ "$MODE" = directives ] && die "a local run has no directives; $PROG directives takes lsf or slurm"
+        command -v xargs >/dev/null 2>&1 || die "--scheduler local needs xargs on PATH" ;;
+    *) die "--scheduler must be lsf, slurm, local or auto" ;;
 esac
 
 if [ -z "$NAME" ]; then
@@ -567,10 +583,30 @@ for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "tasks:$TASKS" "concurrenc
     [ -n "$v" ] || continue
     case $v in ''|*[!0-9]*) die "--${pair%%:*} must be a whole number, got '$v'" ;; esac
 done
+
+# Nothing allocates anything in a local run, so a request for a queue, a
+# walltime or a GPU has no one to make it to. A template is the usual source
+# of them, and testing a cluster job here should say so rather than fail.
+if [ "$SCHED" = local ]; then
+    IGNORED=
+    for pair in "--account:$ACCOUNT" "--queue:$QUEUE" "--qos:$QOS" \
+            "--walltime:$WALLTIME" "--mem:$MEM" "--nodes:$NODES" \
+            "--cores:$CORES" "--tasks:$TASKS" "--constraint:$CONSTRAINT" \
+            "--gpu:$GPUS"; do
+        v=${pair#*:}
+        case $v in '' | 0) continue ;; esac
+        IGNORED="$IGNORED ${pair%%:*}"
+    done
+    [ "$NDIR" -gt 0 ] && IGNORED="$IGNORED --directive"
+    if [ -n "$IGNORED" ]; then
+        warn "a local run cannot honour:$IGNORED (nothing here allocates resources;
+       two tasks at once share the same CPUs and the same GPU)"
+    fi
+fi
 # Plain if/else: a failing test inside a command substitution would make the
 # assignment itself fail, and set -e would end the run right here.
 if [ -n "$SCHED_SRC" ] && [ "$SCHED_SRC" != "$SCHED" ] && [ -n "$WALLTIME" ] \
-        && [ "$WALLTIME_UNITS" -eq 0 ]; then
+        && [ "$WALLTIME_UNITS" -eq 0 ] && [ "$SCHED" != local ]; then
     warn "walltime '$WALLTIME' was written for $SCHED_SRC and is being rendered for $SCHED;
        LSF reads [hh]:mm while Slurm reads [d-]hh:mm:ss (to Slurm, '24:00' is 24 minutes).
        Check it before using this."
@@ -602,6 +638,9 @@ fi
 HDR=(); NH=0
 hdr() { HDR[NH]=$1; NH=$((NH+1)); }
 build_header() {
+    # A local run has no scheduler to address, so the script carries no
+    # directive block at all — just the body every task shares.
+    if [ "$SCHED" = local ]; then return 0; fi
     if [ "$SCHED" = slurm ]; then
         hdr "#SBATCH -J $NAME"
         [ -n "$ACCOUNT" ] && hdr "#SBATCH -A $ACCOUNT"
@@ -670,7 +709,7 @@ if [ -n "$WALLTIME" ]; then
     fi
 fi
     build_header
-    printf '%s\n' "${HDR[@]}"
+    printf '%s\n' ${HDR[@]+"${HDR[@]}"}
     printf '# job name, log paths and the 1-N array range are filled in per submission\n'
     exit 0
 fi
@@ -875,6 +914,7 @@ fi
 # submission gets its own stamped directory, and the logs one has to exist
 # before the scheduler writes into it.
 if [ "$DRYRUN" -eq 1 ]; then
+    STAMP=dry-run
     RUNDIR=.qmap/dry-run
     rm -rf "$RUNDIR"
     mkdir -p "$RUNDIR"
@@ -895,14 +935,22 @@ build_header
 {
     printf '#!/usr/bin/env bash\n'
     printf '# Generated by %s %s on %s\n' "$PROG" "$VERSION" "$(date)"
-    printf '# %d tasks, %s%s. Edit and resubmit this file directly if you need\n' \
-        "$N" "$SCHED" "$TPL_NOTE"
-    printf '# something qmap has no flag for.\n'
-    printf '%s\n' "${HDR[@]}"
+    if [ "$SCHED" = local ]; then
+        printf '# %d tasks, run here%s. One task per QMAP_TASK_ID; run.sh beside this\n' \
+            "$N" "$TPL_NOTE"
+        printf '# file walks them. Edit either directly if you need something qmap\n'
+        printf '# has no flag for.\n'
+    else
+        printf '# %d tasks, %s%s. Edit and resubmit this file directly if you need\n' \
+            "$N" "$SCHED" "$TPL_NOTE"
+        printf '# something qmap has no flag for.\n'
+    fi
+    [ "$NH" -gt 0 ] && printf '%s\n' "${HDR[@]}"
     printf '\nset -euo pipefail\n\n'
-    printf '# Read from whichever scheduler started us, so this file runs under either.\n'
-    printf 'IDX="${SLURM_ARRAY_TASK_ID:-${LSB_JOBINDEX:-}}"\n'
-    printf '[ -n "$IDX" ] || { echo "not running as an array task" >&2; exit 1; }\n'
+    printf '# Read from whichever scheduler started us, so this file runs under either;\n'
+    printf '# QMAP_TASK_ID is how a local run, and a hand re-run of one task, says which.\n'
+    printf 'IDX="${QMAP_TASK_ID:-${SLURM_ARRAY_TASK_ID:-${LSB_JOBINDEX:-}}}"\n'
+    printf '[ -n "$IDX" ] || { echo "no task index: set QMAP_TASK_ID=N to run task N by hand" >&2; exit 1; }\n'
     printf 'N=%d\n' "$N"
     printf 'LIST=%s\n\n' "$(sq "$LIST")"
     printf 'cd %s\n\n' "$(sq "$CHDIR")"
@@ -957,21 +1005,102 @@ build_header
 } > "$SCRIPT"
 chmod +x "$SCRIPT"
 
-# -------------------------------------------------------------------- submit
-if [ "$DRYRUN" -eq 1 ]; then
-    cat "$SCRIPT"
-    printf '\n%s: dry run. script %s, list %s (%d inputs). Nothing submitted.\n' \
-        "$PROG" "$SCRIPT" "$LIST" "$N" >&2
+# -------------------------------------------------------------- local runner
+# A local run has no scheduler to hand the array to, so qmap writes the driver
+# that walks the task indices and keeps it beside the job script. It stands
+# alone like everything else here: run it again to repeat the array, or name
+# task numbers to redo only those.
+PAR=${CONCURRENCY:-1}
+RUNNER=$RUNDIR/run.sh
+if [ "$SCHED" = local ]; then
+    RUNDIR_ABS=$(cd "$RUNDIR" && pwd)
+    # The logs are addressed from inside run.sh, which may be started from
+    # anywhere; a default logdir is relative to where qmap was run.
+    case $LOGDIR in /*) LOGDIR_ABS=$LOGDIR ;; *) LOGDIR_ABS=$PWD/$LOGDIR ;; esac
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf '# Generated by %s %s on %s\n' "$PROG" "$VERSION" "$(date)"
+        printf '# Runs job.sh once per task, %s at a time.\n' "$PAR"
+        printf '#   ./run.sh        all %d tasks\n' "$N"
+        printf '#   ./run.sh 2 5    only the task numbers you name\n'
+        printf 'JOB=%s\n' "$(sq "$RUNDIR_ABS/job.sh")"
+        printf 'SELF=%s\n' "$(sq "$RUNDIR_ABS/run.sh")"
+        printf 'FAILED=%s\n' "$(sq "$RUNDIR_ABS/failed")"
+        printf 'LOGDIR=%s\n' "$(sq "$LOGDIR_ABS")"
+        printf 'STAMP=%s\n' "$(sq "$STAMP")"
+        printf 'N=%d\n' "$N"
+        printf 'P=%s\n' "$PAR"
+        cat <<'RUNNER_BODY'
+
+# No -e: a failed task is reported and counted, not a reason to abandon the
+# rest of the array, which is how a scheduler would treat it too.
+set -uo pipefail
+
+# Re-invoked through xargs below, once per task. Each task gets its own pair
+# of log files, as it would under a scheduler, so parallel tasks do not
+# interleave their output into an unreadable single stream.
+if [ "${1:-}" = --task ]; then
+    idx=$2
+    log=$LOGDIR/local-${STAMP}_${idx}
+    if QMAP_TASK_ID=$idx "$JOB" > "$log.out" 2> "$log.err"; then
+        printf '  [%s/%s] ok\n' "$idx" "$N"
+    else
+        st=$?
+        printf '%s\n' "$idx" >> "$FAILED"
+        printf '  [%s/%s] FAILED (exit %s) %s.err\n' "$idx" "$N" "$st" "$log"
+    fi
     exit 0
 fi
 
-printf '%s: %d tasks%s, %s%s\n' "$PROG" "$N" \
-    "${CONCURRENCY:+, $CONCURRENCY at a time}" "$SCHED" "$TPL_NOTE"
+mkdir -p "$LOGDIR"
+: > "$FAILED"
+if [ $# -gt 0 ]; then IDXS=$*; else IDXS=$(seq 1 "$N"); fi
+# bash 3.2 has no `wait -n`, so xargs -P is the portable way to keep exactly
+# P tasks running at once.
+printf '%s\n' $IDXS | xargs -P "$P" -I {} "$SELF" --task {}
+
+nfailed=$(wc -l < "$FAILED" | tr -d '[:space:]')
+if [ "$nfailed" -gt 0 ]; then
+    failed=$(tr '\n' ' ' < "$FAILED"); failed=${failed% }
+    printf 'qmap: %s task(s) failed: %s\n' "$nfailed" "$failed" >&2
+    printf 'qmap: rerun those with: %s %s\n' "$SELF" "$failed" >&2
+    exit 1
+fi
+printf 'qmap: all %s tasks ok; logs in %s/\n' "$N" "$LOGDIR"
+RUNNER_BODY
+    } > "$RUNNER"
+    chmod +x "$RUNNER"
+fi
+
+# -------------------------------------------------------------------- submit
+if [ "$DRYRUN" -eq 1 ]; then
+    cat "$SCRIPT"
+    if [ "$SCHED" = local ]; then
+        printf '\n# ---------------- %s ----------------\n' "$RUNNER"
+        cat "$RUNNER"
+        printf '\n%s: dry run. script %s, runner %s, list %s (%d inputs). Nothing run.\n' \
+            "$PROG" "$SCRIPT" "$RUNNER" "$LIST" "$N" >&2
+    else
+        printf '\n%s: dry run. script %s, list %s (%d inputs). Nothing submitted.\n' \
+            "$PROG" "$SCRIPT" "$LIST" "$N" >&2
+    fi
+    exit 0
+fi
+
+# Local parallelism is always a number — one at a time when none was asked
+# for — while a scheduler left without --concurrency has no cap to report.
+if [ "$SCHED" = local ]; then
+    PARNOTE=", $PAR at a time"
+else
+    PARNOTE=${CONCURRENCY:+, $CONCURRENCY at a time}
+fi
+printf '%s: %d tasks%s, %s%s\n' "$PROG" "$N" "$PARNOTE" "$SCHED" "$TPL_NOTE"
 printf '  first: %s\n  last:  %s\n' "${INPUTS[0]}" "${INPUTS[N-1]}"
 printf '  script %s\n  logs   %s/\n' "$SCRIPT" "$LOGDIR"
 
-if [ "$SCHED" = slurm ]; then
-    sbatch "$SCRIPT"
-else
-    bsub < "$SCRIPT"
-fi
+case $SCHED in
+    slurm) sbatch "$SCRIPT" ;;
+    lsf)   bsub < "$SCRIPT" ;;
+    # exec so that the run's exit status is qmap's, and Ctrl-C reaches it.
+    local) printf '  runner %s\n\n' "$RUNNER"; exec "$RUNNER" ;;
+esac

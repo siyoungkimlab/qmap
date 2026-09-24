@@ -65,6 +65,7 @@ DIRECTIVES = {
     "module": "--module",
     "directive": "--directive",
     "dependency": "--dependency", "depend": "--dependency",
+    "repeat": "--repeat", "chain": "--repeat",
     "export": "--export",
     "setup": "--setup",
     "name": "--name",

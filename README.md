@@ -76,7 +76,7 @@ tasks. Nothing of it reaches the compute node.
 
 Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 `time`/`walltime`, `core`/`cores`, `cores_per_gpu`, `gpu`, `nodes`, `queue`/`partition`,
-`mem`, `qos`, `constraint`, `concurrency`, `dependency`, `conda`, `module`,
+`mem`, `qos`, `constraint`, `concurrency`, `dependency`, `repeat`, `conda`, `module`,
 `directive`, `export`, `setup`, `name`, `logdir`, `template`. A bare `#name` is a registered template:
 
 ```python
@@ -427,6 +427,7 @@ body or the run instead:
 | `--scheduler S` | `#workload_manager=`, `#scheduler=` | `lsf`, `slurm`, `local`, or auto from `$PATH` |
 | `--dry-run` | — | print the script, submit nothing |
 | `--parsable` | — | print the new job id alone on stdout |
+| `--repeat N` | `#repeat=`, `#chain=` | submit the array N times, each after the last |
 
 ## Running locally: `--scheduler local`
 
@@ -509,47 +510,78 @@ Repeat the flag to wait on several; they are ANDed. Only a plain numeric job
 id renders for both schedulers, so an array element, a job name or an `or`
 is refused rather than half-translated — write those with `--directive`.
 
-### Running the same job N times, one after another
+### Running the same job N times, one after another: `--repeat`
 
-Chaining past a walltime limit wants `any:`, not `ok:` — a link that times
-out or dies has still left the queue, and `ok:` would wedge the rest of the
-chain behind it.
-
-On Slurm this needs no job ids at all. `singleton` means "wait for every
-earlier job of mine with this name", so ten submissions sharing one `--name`
-serialise themselves:
+A simulation longer than the queue's walltime is submitted as a chain: each
+link picks up where the last one stopped. `--repeat` writes that chain.
 
 ```bash
-for i in $(seq 1 10); do
-    qmap step3_md.py --name md_chain --dependency singleton
-done
+./my_job.py --repeat 10
 ```
 
-The chain is keyed on name and user, so pick a name you are not reusing
-elsewhere.
+Ten links queue at once, each held until the one before it has left the queue
+— `any:`, not `ok:`, so a link that fails or runs out of walltime still lets
+the next one go. Anything `--dependency` asks for is carried by the first
+link, so the whole chain can hang off an earlier job:
 
-On either scheduler, `--parsable` prints the new job id and nothing else,
-which is what makes an explicit chain short:
+```bash
+./my_job.py --repeat 10 --dependency ok:12345
+```
+
+```
+  link 1/10 is job 981100
+  link 2/10 is job 981101, after 981100
+  ...
+qmap: 10 links queued; ids in .qmap/my_job-20260101-120000/jobid
+```
+
+Each link is a separate array job with its own script, written side by side
+as `job-01.sh` through `job-10.sh` and differing only in that one dependency
+line, so you can read exactly what each will do. They share one `inputs.txt`.
+A dependency on an array waits for the whole array to drain, not just its
+first task.
+
+**This only helps if the work resumes.** Every link runs the same command
+over the same inputs, so without a checkpoint to restart from — or a
+`--done-when` that skips what is finished — you will run the same work ten
+times:
+
+```
+#done_when=test -s {input.parent}/md_{input.stem}/production.done
+```
+
+In a job file the Python runs once, at submit time, so all ten links share
+the input list computed then; a file appearing later is not picked up by any
+of them.
+
+Under `--scheduler local` there is no queue to wait on, so `--repeat` simply
+runs the array again, in sequence, continuing after a pass that had failures.
+Each pass gets its own log files, marked `p1`, `p2` and so on.
+
+#### Doing it by hand
+
+`--repeat` is a loop qmap writes for you; the pieces are usable directly.
+`--parsable` prints the new job id and nothing else:
 
 ```bash
 prev=
 for i in $(seq 1 10); do
     dep=(); [ -n "$prev" ] && dep=(--dependency "any:$prev")
-    prev=$(qmap step3_md.py --name "md_$i" "${dep[@]}" --parsable)
-    echo "link $i is job $prev"
+    prev=$(qmap my_job.py --name "md_$i" "${dep[@]}" --parsable)
 done
 ```
 
-Each link is an array job, and a dependency on it waits for the whole array
-to drain, not just its first task.
+On Slurm, `singleton` avoids job ids altogether — it means "wait for every
+earlier job of mine with this name", so submissions sharing one `--name`
+serialise themselves. A job file takes its name from the file, so:
 
-Ten links only help if links 2 to 10 pick up where the last one stopped, so
-pair this with `--done-when` (or your tool's own checkpoint/restart), or you
-will run the same work ten times:
+```bash
+for i in $(seq 1 10); do ./my_job.py --dependency singleton; done
+```
 
-```
-#done_when=test -s md_${pdb}/production.done
-```
+That re-runs the Python each time, which is the one thing `--repeat` does
+not: use it when the input list should be recomputed per link. The chain is
+keyed on name and user, so pick a name you are not reusing elsewhere.
 
 Without `--parsable` the job id is printed with the rest of the summary and
 written to `.qmap/<name>-<stamp>/jobid`.
@@ -561,6 +593,7 @@ written to `.qmap/<name>-<stamp>/jobid`.
     job.sh        the generated script, exactly as submitted
     inputs.txt    the input list that script indexes into
     jobid         the id the scheduler gave it, once submitted
+                  (--repeat: one per line, in order)
     run.sh        --scheduler local only: the driver that walks the tasks
     failed        --scheduler local only: the tasks that came back non-zero
 logs_<name>/      per-task stdout and stderr

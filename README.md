@@ -76,8 +76,8 @@ tasks. Nothing of it reaches the compute node.
 
 Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 `time`/`walltime`, `core`/`cores`, `cores_per_gpu`, `gpu`, `nodes`, `queue`/`partition`,
-`mem`, `qos`, `constraint`, `concurrency`, `conda`, `module`, `directive`, `export`,
-`setup`, `name`, `logdir`, `template`. A bare `#name` is a registered template:
+`mem`, `qos`, `constraint`, `concurrency`, `dependency`, `conda`, `module`,
+`directive`, `export`, `setup`, `name`, `logdir`, `template`. A bare `#name` is a registered template:
 
 ```python
 #Gautschi_H100_1GPU_4h
@@ -397,6 +397,11 @@ the four rows marked *always*.
 | `--constraint C` | `#constraint=` | `-C C` | `-R C` |
 | `--walltime T` | `#time=`, `#walltime=` | `-t [d-]hh:mm:ss` | `-W [hh]:mm` |
 | `--concurrency N` | `#concurrency=` | `%N` on `--array` | `%N` on `-J` |
+| `--dependency ok:ID` | `#dependency=` | `-d afterok:ID` | `-w "done(ID)"` |
+| `--dependency any:ID` | `#dependency=` | `-d afterany:ID` | `-w "ended(ID)"` |
+| `--dependency fail:ID` | `#dependency=` | `-d afternotok:ID` | `-w "exit(ID)"` |
+| `--dependency start:ID` | `#dependency=` | `-d after:ID` | `-w "started(ID)"` |
+| `--dependency singleton` | `#dependency=` | `-d singleton` | — (refused; use `--directive`) |
 | `--logdir DIR` | `#logdir=` | `-o DIR/%A_%a.out`, `-e …err` *(always)* | `-o DIR/%J_%I.out`, `-e …err` *(always)* |
 | *(the input count)* | — | `--array=1-N` *(always)* | `[1-N]` on `-J` *(always)* |
 | `--directive TEXT` | `#directive=` | `#SBATCH TEXT` | `#BSUB TEXT` |
@@ -421,6 +426,7 @@ body or the run instead:
 | `--done-when 'TEST'` | — | skip inputs already finished |
 | `--scheduler S` | `#workload_manager=`, `#scheduler=` | `lsf`, `slurm`, `local`, or auto from `$PATH` |
 | `--dry-run` | — | print the script, submit nothing |
+| `--parsable` | — | print the new job id alone on stdout |
 
 ## Running locally: `--scheduler local`
 
@@ -480,12 +486,81 @@ QMAP_TASK_ID=2 .qmap/demo-20260919-173404/job.sh
 state of a laptop, and it should not quietly mean "run a thousand tasks here";
 ask for it by name.
 
+## Chaining jobs: `--dependency`
+
+A job that has to wait for another one is spelled differently by each
+scheduler, so `--dependency` takes one neutral spelling and renders whichever
+is needed. A bare id means `ok:`, which is the common case:
+
+```bash
+qmap step3_md.py --dependency 12345        # after 12345 succeeds
+qmap step3_md.py --dependency any:12345    # after it ends, however it ended
+```
+
+| qmap | means | Slurm | LSF |
+| --- | --- | --- | --- |
+| `ok:ID` | after ID succeeded | `afterok:ID` | `done(ID)` |
+| `any:ID` | after ID ended, any status | `afterany:ID` | `ended(ID)` |
+| `fail:ID` | after ID failed | `afternotok:ID` | `exit(ID)` |
+| `start:ID` | after ID started | `after:ID` | `started(ID)` |
+| `singleton` | after every earlier job of yours with this `--name` | `singleton` | — |
+
+Repeat the flag to wait on several; they are ANDed. Only a plain numeric job
+id renders for both schedulers, so an array element, a job name or an `or`
+is refused rather than half-translated — write those with `--directive`.
+
+### Running the same job N times, one after another
+
+Chaining past a walltime limit wants `any:`, not `ok:` — a link that times
+out or dies has still left the queue, and `ok:` would wedge the rest of the
+chain behind it.
+
+On Slurm this needs no job ids at all. `singleton` means "wait for every
+earlier job of mine with this name", so ten submissions sharing one `--name`
+serialise themselves:
+
+```bash
+for i in $(seq 1 10); do
+    qmap step3_md.py --name md_chain --dependency singleton
+done
+```
+
+The chain is keyed on name and user, so pick a name you are not reusing
+elsewhere.
+
+On either scheduler, `--parsable` prints the new job id and nothing else,
+which is what makes an explicit chain short:
+
+```bash
+prev=
+for i in $(seq 1 10); do
+    dep=(); [ -n "$prev" ] && dep=(--dependency "any:$prev")
+    prev=$(qmap step3_md.py --name "md_$i" "${dep[@]}" --parsable)
+    echo "link $i is job $prev"
+done
+```
+
+Each link is an array job, and a dependency on it waits for the whole array
+to drain, not just its first task.
+
+Ten links only help if links 2 to 10 pick up where the last one stopped, so
+pair this with `--done-when` (or your tool's own checkpoint/restart), or you
+will run the same work ten times:
+
+```
+#done_when=test -s md_${pdb}/production.done
+```
+
+Without `--parsable` the job id is printed with the rest of the summary and
+written to `.qmap/<name>-<stamp>/jobid`.
+
 ## What a submission leaves behind
 
 ```
 .qmap/<name>-<timestamp>/
     job.sh        the generated script, exactly as submitted
     inputs.txt    the input list that script indexes into
+    jobid         the id the scheduler gave it, once submitted
     run.sh        --scheduler local only: the driver that walks the tasks
     failed        --scheduler local only: the tasks that came back non-zero
 logs_<name>/      per-task stdout and stderr

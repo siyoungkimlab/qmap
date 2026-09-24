@@ -64,13 +64,15 @@ DIRECTIVES = {
     "conda": "--conda", "env": "--conda",
     "module": "--module",
     "directive": "--directive",
+    "dependency": "--dependency", "depend": "--dependency",
     "export": "--export",
     "setup": "--setup",
     "name": "--name",
     "logdir": "--logdir",
     "template": "--template",
 }
-REPEATABLE = {"--module", "--directive", "--export", "--setup", "--template"}
+REPEATABLE = {"--module", "--directive", "--export", "--setup", "--template",
+              "--dependency"}
 
 BANG = re.compile(r"^(?P<indent>[ \t]*)!(?P<cmd>.*)$")
 VAR = re.compile(r"\$\{(?P<braced>[A-Za-z_]\w*)\}|\$(?P<bare>[A-Za-z_]\w*)")

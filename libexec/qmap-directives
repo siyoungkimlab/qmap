@@ -158,6 +158,47 @@ def keep(out, flag, value, shown):
     out[flag] = value
 
 
+# Dependency keywords, each scheduler's spelling -> qmap's neutral one.
+SLURM_DEP = {"afterok": "ok", "afterany": "any", "afternotok": "fail",
+             "after": "start"}
+LSF_DEP = {"done": "ok", "ended": "any", "exit": "fail", "started": "start"}
+
+
+def read_dep_slurm(value, deps):
+    """afterok:1:2,afterany:3 -> ok:1 ok:2 any:3. False if it does not fit."""
+    got = []
+    for clause in value.split(","):
+        clause = clause.strip()
+        if clause == "singleton":
+            got.append("singleton")
+            continue
+        head, _, rest = clause.partition(":")
+        kind = SLURM_DEP.get(head)
+        if kind is None or not rest:
+            return False
+        for jid in rest.split(":"):
+            if not jid.isdigit():       # an array element, 12345_3, is not one
+                return False
+            got.append(f"{kind}:{jid}")
+    deps.extend(got)
+    return bool(got)
+
+
+def read_dep_lsf(value, deps):
+    """done(1) && ended(2) -> ok:1 any:2. False if it does not fit."""
+    got = []
+    for part in re.split(r"\s*&&\s*", value.strip()):
+        m = re.match(r"^(\w+)\(\s*(\d+)\s*\)$", part.strip())
+        if not m:
+            return False
+        kind = LSF_DEP.get(m.group(1))
+        if kind is None:
+            return False
+        got.append(f"{kind}:{m.group(2)}")
+    deps.extend(got)
+    return bool(got)
+
+
 ATTACHED_SLURM = re.compile(r"^-([ANncptqCJ])(.+)$")
 ATTACHED_LSF = re.compile(r"^-([nqWPJ])(\d.*)$")
 
@@ -174,7 +215,7 @@ def split_attached(tokens, pattern):
     return out
 
 
-def parse_lsf(tokens, out, extra):
+def parse_lsf(tokens, out, extra, deps):
     tokens = split_attached(tokens, ATTACHED_LSF)
     it = iter(range(len(tokens)))
     i = 0
@@ -221,6 +262,17 @@ def parse_lsf(tokens, out, extra):
             i += 2
         elif t in ("-o", "-e"):
             i += 2                         # log paths are qmap's to generate
+        elif t == "-w":
+            # An 'or', a name or an array element has no neutral spelling;
+            # those stay exactly as written rather than being half-translated.
+            if nxt is None:
+                extra.append(t)
+            elif not read_dep_lsf(nxt, deps):
+                note(f"could not translate -w {nxt}: a name, an array element "
+                     "or an 'or' has no Slurm spelling. Rewrite it by hand if "
+                     "this is going to Slurm.")
+                extra.append(f"{t} {nxt}")
+            i += 2
         elif t == "-L":
             i += 2                         # always emitted
         elif t == "-u":
@@ -232,7 +284,7 @@ def parse_lsf(tokens, out, extra):
                 extra.append(t); i += 1
 
 
-def parse_slurm(tokens, out, extra):
+def parse_slurm(tokens, out, extra, deps):
     tokens = split_attached(tokens, ATTACHED_SLURM)
     i = 0
     while i < len(tokens):
@@ -280,6 +332,16 @@ def parse_slurm(tokens, out, extra):
         elif t in ("-n", "--ntasks"):
             if value != "1":                  # 1 is qmap's default shape
                 keep(out, "--tasks", value, t)
+        elif t in ("-d", "--dependency"):
+            if value is None:
+                extra.append(t)
+            elif not read_dep_slurm(value, deps):
+                # Kept verbatim, which is right for a script staying on Slurm
+                # and wrong for one crossing over; say so either way.
+                note(f"could not translate {t} {value}: an array element, a name "
+                     "or an 'or' has no LSF spelling. Rewrite it by hand if this "
+                     "is going to LSF.")
+                extra.append(f"{t}={value}" if consumed == 1 else f"{t} {value}")
         elif t in ("-o", "--output", "-e", "--error"):
             pass
         elif t.startswith("--mail"):
@@ -307,9 +369,9 @@ def main(argv):
         die("both #SBATCH and #BSUB lines are present; split them first")
     kind = kinds.pop()
 
-    out, extra = {}, []
+    out, extra, deps = {}, [], []
     for _, tokens in blocks:
-        (parse_lsf if kind == "bsub" else parse_slurm)(tokens, out, extra)
+        (parse_lsf if kind == "bsub" else parse_slurm)(tokens, out, extra, deps)
 
     print("--scheduler")
     print("lsf" if kind == "bsub" else "slurm")
@@ -318,6 +380,9 @@ def main(argv):
             continue
         print(flag)
         print(value)
+    for d in deps:
+        print("--dependency")
+        print(d)
     for raw in extra:
         note(f"kept as a raw directive: {raw}")
         print("--directive")

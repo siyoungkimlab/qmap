@@ -116,6 +116,16 @@ Submission parameters (all optional; omitted from the script when not given)
   --qos Q              Slurm QOS (-q); LSF has none, use --directive
   --account A          LSF -P / Slurm -A
   --constraint C       LSF -R C / Slurm -C C   (e.g. A100)
+  --dependency SPEC    hold this job until another has ended; repeatable,
+                       and the spellings translate between schedulers
+                         ok:ID      after ID succeeds    (the default kind,
+                                    so a bare --dependency ID means this)
+                         any:ID     after ID ends, whatever its exit status
+                         fail:ID    after ID fails
+                         start:ID   after ID starts
+                         singleton  after every earlier job of yours with
+                                    this same --name (Slurm only)
+                       Chaining a job past a walltime limit wants any:ID.
   --concurrency N      cap tasks running at once. Under --scheduler local
                        this is the parallelism, and leaving it out means one
                        at a time, not all at once
@@ -138,6 +148,9 @@ Behaviour
                        options only a scheduler can honour are ignored, with
                        a warning naming them
   --dry-run, -n        print the generated script, submit nothing
+  --parsable           print the new job id alone on stdout and nothing else,
+                       so that id=$(qmap ...) works; everything a person reads
+                       goes to stderr instead
   --version, --help
 USAGE
 }
@@ -145,8 +158,8 @@ USAGE
 KNOWN_FLAGS="--inputs --list --input --stdin --name --gpu --gpus --cores -c
 --cores-per-gpu --tasks --nodes --walltime --mem --queue --qos --account
 --constraint --concurrency --directive --conda --env --module --no-module
---no-modules --export --setup --chdir --done-when --logdir
---scheduler --template -T --dry-run"
+--no-modules --export --setup --chdir --done-when --logdir --dependency
+--scheduler --template -T --dry-run --parsable"
 
 DIRECTIVE_READER=$LIBEXEC/qmap-directives
 OPTS=(); NO=0
@@ -298,7 +311,7 @@ case ${1:-} in
         done
         # Catch a typo now rather than at the next submission. A flag's value
         # is skipped, since --directive '-n 64' legitimately starts with a dash.
-        VALUELESS=" --stdin --no-module --no-modules --dry-run "
+        VALUELESS=" --stdin --no-module --no-modules --dry-run --parsable "
         expect_value=0
         for a in "$@"; do
             if [ "$expect_value" -eq 1 ]; then expect_value=0; continue; fi
@@ -355,7 +368,7 @@ case ${1:-} in
         grep -q '^# note: ' "$f" && printf '\n'
         printf '  options\n'
         # The file is flag-then-value, except for the few flags that take none.
-        VALUELESS=" --stdin --no-module --no-modules --dry-run "
+        VALUELESS=" --stdin --no-module --no-modules --dry-run --parsable "
         pending=
         while IFS= read -r line || [ -n "$line" ]; do
             case $line in '' | \#*) continue ;; esac
@@ -382,7 +395,7 @@ case ${1:-} in
         # Read one scheduler's directives, print the other's.
         shift
         SRC=; TGT=; CARGS=(); NCA=0
-        BOOLS=" --dry-run --stdin --no-module --no-modules "
+        BOOLS=" --dry-run --stdin --no-module --no-modules --parsable "
         while [ $# -gt 0 ]; do
             case $1 in
                 lsf | slurm) TGT=$1 ;;
@@ -419,7 +432,7 @@ case ${1:-} in
         DARGS=(); ND=0
         # Flags that take no value; every other flag swallows the next argument,
         # so a value like 24:00:00 is never mistaken for a template name.
-        BOOLS=" --dry-run --stdin --no-module --no-modules "
+        BOOLS=" --dry-run --stdin --no-module --no-modules --parsable "
         while [ $# -gt 0 ]; do
             case $1 in
                 lsf | slurm) DARGS[ND]=--scheduler; DARGS[$((ND+1))]=$1; ND=$((ND+2)) ;;
@@ -444,9 +457,9 @@ esac
 MODE=${MODE:-submit}
 NAME= SCHED=auto SCHED_SRC= CONCURRENCY= GPUS=0 CORES= CORES_PER_GPU= NODES=
 WALLTIME= MEM= QUEUE= QOS= ACCOUNT= CONSTRAINT= LOGDIR= TASKS=
-CONDA_ENV= CHDIR=$PWD DONE_WHEN= DRYRUN=0 TPL_USED=
-MODULES=() EXPORTS=() SETUP=() DIRECTIVES=() SPECS=() CMD=()
-NMOD=0 NEXP=0 NSET=0 NDIR=0 NSPEC=0 NCMD=0
+CONDA_ENV= CHDIR=$PWD DONE_WHEN= DRYRUN=0 TPL_USED= PARSABLE=0
+MODULES=() EXPORTS=() SETUP=() DIRECTIVES=() SPECS=() CMD=() DEPS=()
+NMOD=0 NEXP=0 NSET=0 NDIR=0 NSPEC=0 NCMD=0 NDEP=0
 
 # ------------------------------------------------- splice in any --template
 # Done before parsing, so a template's options behave exactly as if typed at
@@ -499,6 +512,7 @@ while [ $# -gt 0 ]; do
         --constraint) CONSTRAINT=$2; shift 2 ;;
         --concurrency) CONCURRENCY=$2; shift 2 ;;
         --directive) DIRECTIVES[NDIR]=$2; NDIR=$((NDIR+1)); shift 2 ;;
+        --dependency) DEPS[NDEP]=$2; NDEP=$((NDEP+1)); shift 2 ;;
         --conda|--env) CONDA_ENV=$2; shift 2 ;;
         --module)  MODULES[NMOD]=$2; NMOD=$((NMOD+1)); shift 2 ;;
         --no-module|--no-modules) MODULES=(); NMOD=0; shift ;;
@@ -511,6 +525,7 @@ while [ $# -gt 0 ]; do
             [ -n "$SCHED_SRC" ] || SCHED_SRC=$2      # the first one: a template's
             SCHED=$2; shift 2 ;;
         --dry-run) DRYRUN=1; shift ;;
+        --parsable) PARSABLE=1; shift ;;
         --version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
         --help|-h) usage; exit 0 ;;
         --) shift; while [ $# -gt 0 ]; do CMD[NCMD]=$1; NCMD=$((NCMD+1)); shift; done; break ;;
@@ -584,6 +599,54 @@ for pair in "gpu:$GPUS" "cores:$CORES" "nodes:$NODES" "tasks:$TASKS" "concurrenc
     case $v in ''|*[!0-9]*) die "--${pair%%:*} must be a whole number, got '$v'" ;; esac
 done
 
+# --dependency is written once, in a spelling neither scheduler uses, and
+# rendered into whichever one is submitting. Only a plain numeric job id
+# translates faithfully to both, so anything fancier is refused here rather
+# than half-translated; --directive remains the way to say it exactly.
+DEPN=(); NDEPN=0; DEP_SINGLETON=0
+for spec in ${DEPS[@]+"${DEPS[@]}"}; do
+    case $spec in
+        singleton) DEP_SINGLETON=1; continue ;;
+        ok:* | any:* | fail:* | start:*) dkind=${spec%%:*}; did=${spec#*:} ;;
+        *:*) die "--dependency '$spec': the kind must be ok, any, fail or start" ;;
+        *) dkind=ok; did=$spec ;;
+    esac
+    case $did in
+        '' | *[!0-9]*)
+            die "--dependency '$spec': '$did' is not a job id.
+       Only a plain numeric id renders for both schedulers; for an array
+       element, a job name or an 'or', write it out with --directive." ;;
+    esac
+    DEPN[NDEPN]="$dkind:$did"; NDEPN=$((NDEPN+1))
+done
+
+# Slurm groups ids under one keyword and ANDs the groups with commas; LSF
+# spells each one out and ANDs them with &&.
+DEP_SLURM=; DEP_LSF=
+for dkind in ok any fail start; do
+    dids=
+    for spec in ${DEPN[@]+"${DEPN[@]}"}; do
+        if [ "${spec%%:*}" = "$dkind" ]; then dids="$dids:${spec#*:}"; fi
+    done
+    if [ -n "$dids" ]; then
+        case $dkind in
+            ok) dword=afterok ;; any) dword=afterany ;;
+            fail) dword=afternotok ;; start) dword=after ;;
+        esac
+        DEP_SLURM="${DEP_SLURM:+$DEP_SLURM,}$dword$dids"
+    fi
+done
+if [ "$DEP_SINGLETON" -eq 1 ]; then
+    DEP_SLURM="${DEP_SLURM:+$DEP_SLURM,}singleton"
+fi
+for spec in ${DEPN[@]+"${DEPN[@]}"}; do
+    case ${spec%%:*} in
+        ok) dword=done ;; any) dword=ended ;;
+        fail) dword=exit ;; start) dword=started ;;
+    esac
+    DEP_LSF="${DEP_LSF:+$DEP_LSF && }$dword(${spec#*:})"
+done
+
 # Nothing allocates anything in a local run, so a request for a queue, a
 # walltime or a GPU has no one to make it to. A template is the usual source
 # of them, and testing a cluster job here should say so rather than fail.
@@ -598,9 +661,17 @@ if [ "$SCHED" = local ]; then
         IGNORED="$IGNORED ${pair%%:*}"
     done
     [ "$NDIR" -gt 0 ] && IGNORED="$IGNORED --directive"
+    [ "$NDEP" -gt 0 ] && IGNORED="$IGNORED --dependency"
     if [ -n "$IGNORED" ]; then
-        warn "a local run cannot honour:$IGNORED (nothing here allocates resources;
-       two tasks at once share the same CPUs and the same GPU)"
+        # The GPU caveat only belongs here when a GPU was actually asked for.
+        if [ "${GPUS:-0}" != 0 ]; then
+            warn "a local run cannot honour:$IGNORED — there is no scheduler here to
+       hold, queue or allocate anything, and two tasks at once share the same
+       CPUs and the same GPU."
+        else
+            warn "a local run cannot honour:$IGNORED — there is no scheduler here to
+       hold, queue or allocate anything."
+        fi
     fi
 fi
 # Plain if/else: a failing test inside a command substitution would make the
@@ -610,6 +681,11 @@ if [ -n "$SCHED_SRC" ] && [ "$SCHED_SRC" != "$SCHED" ] && [ -n "$WALLTIME" ] \
     warn "walltime '$WALLTIME' was written for $SCHED_SRC and is being rendered for $SCHED;
        LSF reads [hh]:mm while Slurm reads [d-]hh:mm:ss (to Slurm, '24:00' is 24 minutes).
        Check it before using this."
+fi
+
+if [ "$PARSABLE" -eq 1 ]; then
+    [ "$SCHED" = local ] && die "--parsable prints a job id, and a local run has none"
+    [ "$DRYRUN" -eq 1 ] && die "--parsable prints the job id of a submission; a dry run makes none"
 fi
 
 for req in $REQUIRED; do
@@ -657,6 +733,7 @@ build_header() {
         [ -n "$CONSTRAINT" ] && hdr "#SBATCH -C $CONSTRAINT"
         [ -n "$MEM" ] && hdr "#SBATCH --mem=$MEM"
         [ -n "$WALLTIME" ] && hdr "#SBATCH -t $WALLTIME"
+        [ -n "$DEP_SLURM" ] && hdr "#SBATCH -d $DEP_SLURM"
         hdr "#SBATCH -o $LOGDIR/%A_%a.out"; hdr "#SBATCH -e $LOGDIR/%A_%a.err"
         hdr "#SBATCH --array=1-$N${CONCURRENCY:+%$CONCURRENCY}"
         for d in ${DIRECTIVES[@]+"${DIRECTIVES[@]}"}; do hdr "#SBATCH $d"; done
@@ -684,6 +761,17 @@ build_header() {
         [ -n "$MEM" ] && hdr "#BSUB -R \"rusage[mem=$MEM]\""
         [ "${GPUS:-0}" != 0 ] && hdr "#BSUB -gpu \"num=$GPUS:mode=exclusive_process\""
         [ -n "$WALLTIME" ] && hdr "#BSUB -W $WALLTIME"
+        if [ "$DEP_SINGLETON" -eq 1 ]; then
+            # Same reasoning as --qos: converting may drop what LSF has no
+            # equivalent for as long as it says so; submitting may not.
+            if [ "$MODE" = directives ]; then
+                warn "dropped --dependency singleton: LSF has no equivalent"
+            else
+                die "LSF has no singleton dependency; it is Slurm-only.
+       The nearest thing is a wait on the job name, via --directive '-w ended($NAME)'."
+            fi
+        fi
+        [ -n "$DEP_LSF" ] && hdr "#BSUB -w \"$DEP_LSF\""
         hdr "#BSUB -o $LOGDIR/%J_%I.out"; hdr "#BSUB -e $LOGDIR/%J_%I.err"
         # The generated script is bash; without this LSF would run it under the
         # submitter's login shell.
@@ -1094,13 +1182,54 @@ if [ "$SCHED" = local ]; then
 else
     PARNOTE=${CONCURRENCY:+, $CONCURRENCY at a time}
 fi
-printf '%s: %d tasks%s, %s%s\n' "$PROG" "$N" "$PARNOTE" "$SCHED" "$TPL_NOTE"
-printf '  first: %s\n  last:  %s\n' "${INPUTS[0]}" "${INPUTS[N-1]}"
-printf '  script %s\n  logs   %s/\n' "$SCRIPT" "$LOGDIR"
+# With --parsable the only thing on stdout is the job id, so the block a
+# person reads goes to stderr instead. Fd 3 is whichever of the two that is.
+if [ "$PARSABLE" -eq 1 ]; then exec 3>&2; else exec 3>&1; fi
+printf '%s: %d tasks%s, %s%s\n' "$PROG" "$N" "$PARNOTE" "$SCHED" "$TPL_NOTE" >&3
+printf '  first: %s\n  last:  %s\n' "${INPUTS[0]}" "${INPUTS[N-1]}" >&3
+printf '  script %s\n  logs   %s/\n' "$SCRIPT" "$LOGDIR" >&3
 
-case $SCHED in
-    slurm) sbatch "$SCRIPT" ;;
-    lsf)   bsub < "$SCRIPT" ;;
-    # exec so that the run's exit status is qmap's, and Ctrl-C reaches it.
-    local) printf '  runner %s\n\n' "$RUNNER"; exec "$RUNNER" ;;
-esac
+# exec so that the run's exit status is qmap's, and Ctrl-C reaches it.
+if [ "$SCHED" = local ]; then
+    printf '  runner %s\n\n' "$RUNNER" >&3
+    exec "$RUNNER"
+fi
+
+# The job id is captured rather than left to stream past, because it is what
+# the next submission's --dependency needs. set -e is off around the call so
+# that a rejected submission is reported with the scheduler's own words.
+set +e
+if [ "$SCHED" = slurm ]; then
+    SUBMIT_OUT=$(sbatch "$SCRIPT" 2>&1)
+else
+    SUBMIT_OUT=$(bsub < "$SCRIPT" 2>&1)
+fi
+SUBMIT_ST=$?
+set -e
+if [ "$SUBMIT_ST" -ne 0 ]; then
+    [ -n "$SUBMIT_OUT" ] && printf '%s\n' "$SUBMIT_OUT" >&2
+    die "submission failed (exit $SUBMIT_ST); the script is still at $SCRIPT"
+fi
+
+if [ "$SCHED" = slurm ]; then
+    JOBID=$(printf '%s\n' "$SUBMIT_OUT" | awk '/Submitted batch job/{print $NF; exit}')
+else
+    JOBID=$(printf '%s\n' "$SUBMIT_OUT" | sed -n 's/^Job <\([0-9][0-9]*\)>.*/\1/p' | head -1)
+fi
+[ -n "$JOBID" ] && printf '%s\n' "$JOBID" > "$RUNDIR/jobid"
+
+if [ "$PARSABLE" -eq 1 ]; then
+    if [ -z "$JOBID" ]; then
+        printf '%s\n' "$SUBMIT_OUT" >&2
+        die "--parsable: no job id in that reply, so there is nothing to print"
+    fi
+    printf '%s\n' "$SUBMIT_OUT" >&3
+    printf '%s\n' "$JOBID"
+else
+    printf '%s\n' "$SUBMIT_OUT"
+    if [ -n "$JOBID" ]; then
+        printf '  jobid  %s (also in %s/jobid)\n' "$JOBID" "$RUNDIR"
+    else
+        warn "could not read a job id from that reply; no jobid file written"
+    fi
+fi

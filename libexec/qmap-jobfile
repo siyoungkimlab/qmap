@@ -66,6 +66,7 @@ DIRECTIVES = {
     "directive": "--directive",
     "dependency": "--dependency", "depend": "--dependency",
     "repeat": "--repeat", "chain": "--repeat",
+    "bundle": "--bundle", "pack": "--bundle",
     "export": "--export",
     "setup": "--setup",
     "name": "--name",
@@ -307,7 +308,9 @@ def main(argv):
 
     shown = rt.tasks if len(rt.tasks) <= 6 else rt.tasks[:3] + [f"... {len(rt.tasks) - 6} more ..."] + rt.tasks[-3:]
     plural = "" if len(rt.tasks) == 1 else "s"
-    print(f"{PROG}: {len(rt.tasks)} task{plural} from {path}", file=sys.stderr)
+    # "command", not "task": with --bundle several of these share one array
+    # task, and qmap's own summary is what reports the task count.
+    print(f"{PROG}: {len(rt.tasks)} command{plural} from {path}", file=sys.stderr)
     for t in shown:
         print(f"  {t}", file=sys.stderr)
 

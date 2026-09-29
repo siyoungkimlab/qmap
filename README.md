@@ -76,7 +76,8 @@ tasks. Nothing of it reaches the compute node.
 
 Header keys map to the options below: `workload_manager`/`scheduler`, `account`,
 `time`/`walltime`, `core`/`cores`, `cores_per_gpu`, `gpu`, `nodes`, `queue`/`partition`,
-`mem`, `qos`, `constraint`, `concurrency`, `dependency`, `repeat`, `conda`, `module`,
+`mem`, `qos`, `constraint`, `concurrency`, `dependency`, `repeat`, `bundle`,
+`conda`, `module`,
 `directive`, `export`, `setup`, `name`, `logdir`, `template`. A bare `#name` is a registered template:
 
 ```python
@@ -428,6 +429,7 @@ body or the run instead:
 | `--dry-run` | — | print the script, submit nothing |
 | `--parsable` | — | print the new job id alone on stdout |
 | `--repeat N` | `#repeat=`, `#chain=` | submit the array N times, each after the last |
+| `--bundle N` | `#bundle=`, `#pack=` | pack N inputs into each array task |
 
 ## Running locally: `--scheduler local`
 
@@ -585,6 +587,53 @@ keyed on name and user, so pick a name you are not reusing elsewhere.
 
 Without `--parsable` the job id is printed with the rest of the summary and
 written to `.qmap/<name>-<stamp>/jobid`.
+
+## Packing inputs into fewer tasks: `--bundle`
+
+One input per array task is the right shape when starting a task is cheap.
+It is the wrong shape when the queue makes you wait hours for a slot and then
+lets you keep it for days, or when many inputs finish in minutes: you pay a
+long wait for a short run, over and over.
+
+`--bundle N` puts N inputs in each task and runs them one after another, so
+one wait covers all N.
+
+```bash
+qmap --inputs 'yaml/*/*.yaml' --bundle 20 --walltime 48:00:00 \
+     -- mycmd '{input}'
+```
+
+```
+qmap: 12 tasks (235 inputs, 20 per task), slurm
+```
+
+The last task takes whatever is left over, so the count need not divide.
+
+Inside a task the inputs are independent, which is the part a hand-rolled
+`cmd1 && cmd2 && ...` list does not give you:
+
+- **A failing input does not stop the others.** It is counted, the bundle
+  carries on, and the task exits non-zero at the end naming what failed.
+- **`--done-when` is checked per input**, not per task, so a bundle skips the
+  inputs already finished and runs the rest.
+- **`{index}` stays the input's number**, 1..N over the whole list, so output
+  paths built from it do not change when the bundle size does.
+
+```
+task 2/3: inputs 4..6 of 7
+[4/7] f4.txt
+[5/7] f5.txt
+[6/7] f6.txt
+```
+
+Bundling trades granularity for queue time. A bundle is one array task, so it
+gets one log file, one exit status and one line in `failed` — a rerun redoes
+the whole bundle, which is cheap when `--done-when` skips what finished and
+expensive when it does not. Size it at roughly *(walltime you can get)
+divided by (typical input time)*, leaving room for the slowest member, and
+pair it with `--done-when` so a rerun is not a redo.
+
+`--bundle 1` is the default and changes nothing.
 
 ## What a submission leaves behind
 

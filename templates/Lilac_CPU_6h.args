@@ -1,0 +1,12 @@
+# note: MSKCC Lilac, cpuqueue: CPU only, no GPU, 8 slots, 6 hours. Lilac has no
+#       CPU-only nodes; cpuqueue runs on the free cores of the GPU hosts. 6 h is
+#       the most the lab-owned host pools lend out (DURATION[360]), so a longer
+#       walltime shuts those hosts out.
+--scheduler
+lsf
+--queue
+cpuqueue
+--cores
+8
+--walltime
+6h

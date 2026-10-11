@@ -1,0 +1,14 @@
+# note: MSKCC Lilac, cpuqueue on the A100 hosts: CPU only, no GPU, 8 slots, 6 h.
+#       A100 hosts carry an exclusive resource (gpu !A100), so LSF sends a job
+#       there only when it asks for A100 -- even a CPU-only one. They are often
+#       idle while the A40/2080Ti hosts are full. Use beside Lilac_CPU_6h.
+--scheduler
+lsf
+--queue
+cpuqueue
+--cores
+8
+--constraint
+A100
+--walltime
+6h
